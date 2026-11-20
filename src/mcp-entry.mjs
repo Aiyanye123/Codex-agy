@@ -3,7 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import core from "./core.cjs";
+import core from "../core.cjs";
 
 const {
   bindThread, CodexReader, markAccepted, openDatabase, queueTask, recordResult,

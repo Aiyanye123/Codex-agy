@@ -38,7 +38,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Use a Node.js release with node:sqlite support
 
 $server = Join-Path $PSScriptRoot 'mcp.cjs'
 $hook = Join-Path $PSScriptRoot 'hook.cjs'
-$agent = Join-Path $PSScriptRoot 'agent.md'
+$agent = Join-Path $PSScriptRoot 'src/agent.md'
 foreach ($file in @($server, $hook, $agent)) {
     if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Bridge file missing: $file" }
 }

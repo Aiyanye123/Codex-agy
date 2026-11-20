@@ -111,6 +111,6 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | 执行策略阻止 ZIP 中的脚本 | 确认 ZIP 来自本仓库并审阅 `Install.ps1` 后，在桥接目录运行 `Unblock-File -LiteralPath .\Install.ps1`，再执行安装。 |
 | `Get-Command codex.exe` 找不到命令，或 `queue` 不可用 | 按上面的官方指南安装或更新 Windows 版 Codex CLI，再打开新终端确认。 |
 | Codex 做完了，Antigravity 还没汇报 | 在原对话说「查结果」。如果刚创建的会话仍在等待发送，到 Codex App 发送预填任务。如果仍显示运行中，查看 Codex App 是否在等审批。 |
-| 是否需要启用 Codex 钩子 | 日常桥接和后台回执用全局安装即可。需要让 Codex 为特定项目额外记录接单、完成或中断事件时，可从桥接安装目录运行 `.\Install.ps1 -Workspace <项目目录>`，再在 Codex App 的钩子设置里审查并启用对应条目。 |
+| 是否需要启用 Codex 钩子 | 日常完成汇报由 Antigravity 后台等待提供，已配置的 `AGY Codex Bridge` 钩子可以在 Codex App 中关闭。项目钩子可更早记录接单和完成。当前版本还通过钩子记录手动中断。如果需要这些事件，可运行 `.\Install.ps1 -Workspace <项目目录>` 配置，再在 Codex App 中启用。 |
 
 第三方依赖的许可声明见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。
