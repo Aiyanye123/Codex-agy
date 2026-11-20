@@ -1,0 +1,13 @@
+{
+  "name": "codex-agy",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild mcp-entry.mjs --bundle --platform=node --target=node22 --format=cjs --external:./core.cjs --minify --legal-comments=eof --outfile=mcp.cjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "esbuild": "^0.28.2",
+    "zod": "^4.6.7"
+  }
+}

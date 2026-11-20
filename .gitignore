@@ -1,0 +1,5 @@
+/node_modules/
+/.state/
+/.agents/mcp_config.json
+/.agents/agents/codex-agy/
+/.codex/hooks.json
