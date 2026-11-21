@@ -7,6 +7,12 @@ const { promisify } = require("node:util");
 const run = promisify(execFile);
 const uuid = "[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}";
 const taskMarker = new RegExp(`^\\[AGY Codex task: (${uuid})\\]\\r?\\n`, "i");
+// Clearing only a stored receipt is retention housekeeping, not a task update.
+const taskChangedTrigger = `CREATE TRIGGER task_changed AFTER UPDATE OF state, detail, turn_id, thread_id, report ON tasks
+    WHEN NEW.state IS NOT OLD.state OR NEW.detail IS NOT OLD.detail OR NEW.turn_id IS NOT OLD.turn_id
+      OR NEW.thread_id IS NOT OLD.thread_id OR (NEW.report IS NOT OLD.report AND NEW.report IS NOT NULL) BEGIN
+      UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+    END`;
 
 function threadIdFrom(value) {
   const match = new RegExp(`^(?:codex://threads/)?(${uuid})/?$`, "i").exec(value.trim());
@@ -64,16 +70,18 @@ function openDatabase(path) {
       UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = NEW.id;
     END;
-    CREATE TRIGGER IF NOT EXISTS task_changed AFTER UPDATE OF state, detail, turn_id, thread_id, report ON tasks
-    WHEN NEW.state IS NOT OLD.state OR NEW.detail IS NOT OLD.detail OR NEW.turn_id IS NOT OLD.turn_id
-      OR NEW.thread_id IS NOT OLD.thread_id OR NEW.report IS NOT OLD.report BEGIN
-      UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
-    END;
     CREATE TRIGGER IF NOT EXISTS preserve_dismissed BEFORE UPDATE OF state ON tasks
     WHEN OLD.state IN ('cancelled','dismissed') AND NEW.state <> OLD.state BEGIN
       SELECT RAISE(IGNORE);
     END;
   `);
+  const readTaskChanged = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'task_changed'");
+  if (readTaskChanged.get()?.sql !== taskChangedTrigger) {
+    transaction(database, () => {
+      if (readTaskChanged.get()?.sql === taskChangedTrigger) return;
+      database.exec(`DROP TRIGGER IF EXISTS task_changed;\n${taskChangedTrigger}`);
+    });
+  }
   return database;
 }
 

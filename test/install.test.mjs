@@ -4,6 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileS
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const stateRoot = path.join(repo, ".state");
@@ -25,7 +27,7 @@ before(() => {
   sourceAgent = path.join(scratch, "src", "agent.md");
   mkdirSync(path.dirname(sourceAgent));
   copyFileSync(path.join(repo, "src", "agent.md"), sourceAgent);
-  for (const file of ["Install.ps1", "mcp.cjs", "hook.cjs"]) {
+  for (const file of ["Install.ps1", "mcp.cjs", "core.cjs", "hook.cjs"]) {
     copyFileSync(path.join(repo, file), path.join(scratch, file));
   }
   // CLI probes use stand-ins. Even -Global below targets this run's private profile.
@@ -77,7 +79,7 @@ function files(configRoot) {
   return { agent: path.join(configRoot, "agents/codex-agy/agent.md"), mcp: path.join(configRoot, "mcp_config.json") };
 }
 
-test("fresh global install in a disposable profile; repeating it does not rewrite settings", () => {
+test("fresh global install in a disposable profile; repeating it does not rewrite settings", async () => {
   const { agent, mcp } = files(path.join(env.USERPROFILE, ".gemini/config"));
   install("", { global: true });
   assert.equal(readFileSync(agent, "utf8"), readFileSync(sourceAgent, "utf8"));
@@ -85,6 +87,21 @@ test("fresh global install in a disposable profile; repeating it does not rewrit
   assert.equal(server.args[2], ".");
   assert.equal(server.timeoutSeconds, 3700);
   assert.equal(server.tools.watch.background, "always");
+  const client = new Client({ name: "install-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: ["--disable-warning=ExperimentalWarning", path.join(scratch, "mcp.cjs"), ".", ":memory:", "unused"],
+    cwd: scratch,
+  });
+  await client.connect(transport);
+  try {
+    const { tools, nextCursor } = await client.listTools();
+    assert.equal(nextCursor, undefined);
+    assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(server.tools).sort());
+    assert.ok(Object.values(server.tools).every(tool => tool.eager === true));
+    assert.equal(client.getInstructions(), "Use bridge tools directly.");
+    const properties = tools.find(tool => tool.name === "search_workspace").inputSchema.properties;
+    for (const key of ["query", "path", "glob"]) assert.doesNotMatch(properties[key].pattern, /\\u[\da-f]{4}/i);
+  } finally { await client.close(); }
   const receiptDir = path.join(scratch, "state/managed-agents");
   const paths = [agent, mcp, ...readdirSync(receiptDir).map(name => path.join(receiptDir, name))];
   assert.equal(paths.length, 3);
@@ -114,7 +131,7 @@ test("published workspace upgrades its agent and full MCP settings and preserves
   assert.equal(servers.codex_bridge.args[3], path.join(scratch, "state/bridge.sqlite"));
   assert.deepEqual(servers.codex_bridge.tools, { bind: { eager: true }, unbind: { eager: true },
     submit: { eager: true }, resume_draft: { eager: true }, dismiss: { eager: true }, list_tasks: { eager: true },
-    status: { eager: true }, watch: { eager: true, background: "always" } });
+    search_workspace: { eager: true }, recent_replies: { eager: true }, status: { eager: true }, watch: { eager: true, background: "always" } });
   assert.ok(existsSync(path.join(workspace, ".codex/hooks.json")));
 });
 

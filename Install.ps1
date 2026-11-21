@@ -166,6 +166,8 @@ if (!$HooksOnly) {
             resume_draft = @{ eager = $true }
             dismiss = @{ eager = $true }
             list_tasks = @{ eager = $true }
+            search_workspace = @{ eager = $true }
+            recent_replies = @{ eager = $true }
             status = @{ eager = $true }
             watch = [ordered]@{ eager = $true; background = 'always' }
         }

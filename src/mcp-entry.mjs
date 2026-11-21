@@ -5,8 +5,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import core from "../core.cjs";
 import {
-  bindingStatus, dismissTask, dispatchLeaseMs, listTasks, ongoing, readWithRetry, refreshTask, validateFollowUp,
+  bindingStatus, clearExpiredReports, dismissTask, dispatchLeaseMs, listTasks, ongoing, readWithRetry, refreshTask, validateFollowUp,
 } from "./task-state.mjs";
+import { searchWorkspace } from "./workspace-search.mjs";
+import { excerpt, receiptInstruction, recentReplies, reportFields } from "./receipt.mjs";
 
 const {
   bindThread, CodexReader, openDatabase, queueTask,
@@ -15,8 +17,11 @@ const {
 const [, , directory, statePath, codex] = process.argv;
 const workspace = workspacePath(directory);
 const database = openDatabase(statePath);
+clearExpiredReports(database);
 const reader = new CodexReader(codex);
-const server = new McpServer({ name: "agy-codex-bridge", version: "0.1.0" });
+const server = new McpServer({ name: "agy-codex-bridge", version: "0.1.0" }, {
+  instructions: "Use bridge tools directly.",
+});
 const watching = new Set();
 const activeDispatches = new Set();
 
@@ -36,17 +41,25 @@ function reply(data) {
   return { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data };
 }
 
-function reportStatus(task, watchState, extra = {}) {
+function textReply(data) {
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
+}
+
+function reportStatus(task, watchState, extra = {}, reportMode = "none") {
   const binding = database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(task.owner);
-  return reply({
+  const render = reportMode === "none" ? reply : textReply;
+  return render({
     task_id: task.id,
     state: task.state,
     workspace: task.workspace,
     thread_id: task.thread_id,
     thread_url: task.thread_id ? `codex://threads/${task.thread_id}` : null,
     turn_id: task.turn_id,
-    report: task.report,
-    detail: task.detail,
+    ...reportFields(task.report, reportMode),
+    ...(task.state === "reported" && task.report === null && {
+      report_note: "工单已完成。本地回执原文不可用。已完结工单的回执原文超过 30 天后会自动清理。",
+    }),
+    detail: task.detail && excerpt(task.detail, 500),
     created_at: task.created_at,
     updated_at: task.updated_at,
     bound_thread_id: binding?.thread_id ?? null,
@@ -63,14 +76,12 @@ async function readThread(threadId) {
 }
 
 function draftUri(directory, message) {
-  const uri = `codex://threads/new?${new URLSearchParams({ path: directory, prompt: message })}`;
-  if (uri.length > 8000) throw new Error("首单超过桌面链接的长度上限。请压缩工单，把长材料留在工作目录并引用文件。");
-  return uri;
+  return `codex://threads/new?${new URLSearchParams({ path: directory, prompt: message })}`;
 }
 
 function createTask(owner, prompt, target, explicitNewChat) {
   const id = randomUUID();
-  const message = `[AGY Codex task: ${id}]\n\n${prompt}`;
+  const markedPrompt = `[AGY Codex task: ${id}]\n\n${prompt}`;
   return transaction(database, () => {
     const binding = database.prepare("SELECT * FROM bindings WHERE owner = ?").get(owner);
     if (!explicitNewChat && (binding?.thread_id ?? null) !== target.threadId) {
@@ -81,7 +92,14 @@ function createTask(owner, prompt, target, explicitNewChat) {
       if (pending && ongoing.has(pending.state)) return { pending };
     }
     const newChat = !target.threadId;
-    const uri = newChat ? draftUri(target.directory, message) : null;
+    let message = markedPrompt + receiptInstruction;
+    let uri = newChat ? draftUri(target.directory, message) : null;
+    if (uri?.length > 8000) {
+      // Keep drafts that fit without the receipt instruction compatible with the desktop URI limit.
+      message = markedPrompt;
+      uri = draftUri(target.directory, message);
+      if (uri.length > 8000) throw new Error("首单超过桌面链接的长度上限。请压缩工单，把长材料留在工作目录并引用文件。");
+    }
     database.prepare(`
       INSERT INTO tasks (id, owner, workspace, thread_id, state, dispatch_deadline, draft_prompt)
       VALUES (?, ?, ?, ?, 'dispatching', ?, ?)
@@ -189,12 +207,13 @@ server.registerTool("submit", {
 });
 
 server.registerTool("status", {
-  description: "查询当前 Antigravity 对话的指定任务或最近任务，返回派单状态和 Codex 报告。可等待至多 25 秒。",
+  description: "查询当前 Antigravity 工单的状态。默认只查进度；report_mode=summary 查简短结果，full 才取完整回执。可等待至多 25 秒。",
   inputSchema: {
     task_id: z.string().uuid().optional(),
     wait_seconds: z.number().int().min(0).max(25).optional(),
+    report_mode: z.enum(["none", "summary", "full"]).optional(),
   },
-}, async ({ task_id: taskId, wait_seconds: waitSeconds = 0 }, context) => {
+}, async ({ task_id: taskId, wait_seconds: waitSeconds = 0, report_mode: reportMode = "none" }, context) => {
   const owner = conversationOwner(context);
   taskId ??= database.prepare("SELECT id FROM tasks WHERE owner = ? ORDER BY rowid DESC LIMIT 1").get(owner)?.id;
   if (!taskId) {
@@ -209,13 +228,44 @@ server.registerTool("status", {
   }
   await waitForResult(owner, taskId, waitSeconds, 2000, context.signal);
   const binding = await bindingStatus(database, owner, readThread);
-  return reportStatus(taskById(owner, taskId), null, binding);
+  return reportStatus(taskById(owner, taskId), null, binding, reportMode);
 });
 
 server.registerTool("list_tasks", {
   description: "列出当前对话最近的工单，包含状态、工作目录、时间与简要说明。",
   inputSchema: { limit: z.number().int().min(1).max(100).default(10) },
 }, async ({ limit }, context) => reply({ tasks: listTasks(database, conversationOwner(context), limit) }));
+
+server.registerTool("search_workspace", {
+  description: "只读检索 Antigravity 当前工作区。files 找路径，docs 查文档，code 定位代码和配置，text 搜全部文本。path 限定相对路径，glob 可过滤文件。默认按字面匹配，文字结果返回行号和短片段。",
+  inputSchema: z.strictObject({
+    mode: z.enum(["files", "docs", "code", "text"]),
+    query: z.string().trim().max(120).regex(/^[^\x00-\x1f\x7f]*$/u).optional(),
+    path: z.string().max(500).regex(/^[^\x00-\x1f\x7f]+$/u).optional(),
+    glob: z.string().max(120).regex(/^[^\x00-\x1f\x7f]+$/u).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+    per_file: z.number().int().min(1).max(8).optional(),
+    case_sensitive: z.boolean().optional(),
+    whole_word: z.boolean().optional(),
+    regex: z.boolean().optional(),
+    context_lines: z.number().int().min(0).max(2).optional(),
+  }),
+  annotations: { readOnlyHint: true, openWorldHint: false },
+}, async (options, context) => textReply(await searchWorkspace(workspace, options, context.signal)));
+
+server.registerTool("recent_replies", {
+  description: "按需查看当前 Antigravity 对话已绑定的 Codex 会话中最近的最终回复，默认三条、最多六条；无需工单，不会续写会话。",
+  inputSchema: z.strictObject({ limit: z.number().int().min(1).max(6).optional() }),
+  annotations: { readOnlyHint: true, openWorldHint: false },
+}, async ({ limit = 3 }, context) => {
+  const owner = conversationOwner(context);
+  const current = () => database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner)?.thread_id;
+  const threadId = current();
+  if (!threadId) throw new Error("请先绑定要回看的 Codex 会话。");
+  const replies = await recentReplies(reader, threadId, limit, context.signal);
+  if (current() !== threadId) throw new Error("读取时绑定已变化，请核对会话后重试。");
+  return textReply({ thread_id: threadId, replies });
+});
 
 server.registerTool("dismiss", {
   description: "用户明确要求放弃草稿或停止跟踪时使用。仅停止本地跟踪，不代表 Codex App 已撤回执行。",
@@ -251,12 +301,12 @@ server.registerTool("watch", {
   const owner = conversationOwner(context);
   const task = taskById(owner, taskId);
   if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
-  if (!ongoing.has(task.state)) return reportStatus(task);
+  if (!ongoing.has(task.state)) return reportStatus(task, undefined, {}, "summary");
   if (watching.has(taskId)) return reportStatus(task, "already_watching");
   watching.add(taskId);
   try {
     const result = await waitForResult(owner, taskId, 3600, 5000, context.signal);
-    return reportStatus(result, ongoing.has(result.state) ? "timed_out" : undefined);
+    return reportStatus(result, ongoing.has(result.state) ? "timed_out" : undefined, {}, "summary");
   } finally {
     watching.delete(taskId);
   }

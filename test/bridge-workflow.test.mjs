@@ -2,7 +2,7 @@ import { test, after, before } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +54,79 @@ test("migration preserves unknown legacy times and tracks new inserts and state 
     assert.equal(recent.updated_at, recent.created_at);
     assert.deepEqual(listTasks(db, "owner", 10).map(t => t.task_id), [next, id]);
   } finally { db.close(); }
+});
+
+test("MCP startup clears expired receipts without changing task history or bindings", async () => {
+  const file = path.join(scratch, "receipt-retention.sqlite");
+  const db = core.openDatabase(file);
+  const day = 24 * 60 * 60 * 1000;
+  const old = new Date(Date.now() - 31 * day).toISOString();
+  const recent = new Date(Date.now() - 29 * day).toISOString();
+  const cases = [
+    ["reported", old, old, true],
+    ["failed", old, null, true],
+    ["reported", old, recent, false],
+    ["reported", null, null, false],
+    ...["awaiting_send", "dispatching", "queued", "dispatch_unknown", "running"]
+      .map(state => [state, old, old, false]),
+  ];
+  const expired = new Set();
+  let oldestReported;
+  let beforeTasks;
+  let beforeBindings;
+  try {
+    for (const [state, createdAt, updatedAt, shouldExpire] of cases) {
+      const id = insertTask(db, state, "owner", randomUUID());
+      db.prepare("UPDATE tasks SET report = ?, detail = ?, turn_id = ? WHERE id = ?")
+        .run("Complete receipt", "Original detail", randomUUID(), id);
+      db.prepare("UPDATE tasks SET created_at = ?, updated_at = ? WHERE id = ?").run(createdAt, updatedAt, id);
+      if (shouldExpire) {
+        expired.add(id);
+        if (state === "reported") oldestReported = id;
+      }
+    }
+    db.prepare("INSERT INTO bindings (owner, thread_id, pending_task_id) VALUES (?, ?, ?)")
+      .run("another-owner", randomUUID(), randomUUID());
+    beforeTasks = db.prepare("SELECT * FROM tasks ORDER BY rowid").all();
+    beforeBindings = db.prepare("SELECT * FROM bindings").all();
+    // Simulate a database created with the previous trigger, which touched timestamps for every report change.
+    db.exec(`
+      DROP TRIGGER task_changed;
+      CREATE TRIGGER task_changed AFTER UPDATE OF state, detail, turn_id, thread_id, report ON tasks
+      WHEN NEW.state IS NOT OLD.state OR NEW.detail IS NOT OLD.detail OR NEW.turn_id IS NOT OLD.turn_id
+        OR NEW.thread_id IS NOT OLD.thread_id OR NEW.report IS NOT OLD.report BEGIN
+        UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+      END;
+    `);
+  } finally { db.close(); }
+
+  const client = new Client({ name: "receipt-retention-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: [path.join(root, "mcp.cjs"), ".", file, "unused"], cwd: root });
+  await client.connect(transport);
+  const call = async (name, args) => {
+    const response = await client.callTool({ name, arguments: args,
+      _meta: { "antigravity.google/root_conversation_id": "owner" } });
+    assert.ok(!response.isError, JSON.stringify(response.content));
+    return JSON.parse(response.content[0].text);
+  };
+  try {
+    const status = await call("status", { task_id: oldestReported, report_mode: "full" });
+    assert.equal(status.state, "reported");
+    assert.equal(status.has_report, false);
+    assert.match(status.report_note, /已完成.*30 天/);
+    assert.ok((await call("list_tasks", {})).tasks.some(task => task.task_id === oldestReported));
+
+    const cleaned = new DatabaseSync(file);
+    try {
+      const tasks = cleaned.prepare("SELECT * FROM tasks ORDER BY rowid").all();
+      assert.deepEqual(tasks, beforeTasks.map(task => expired.has(task.id) ? Object.assign(task, { report: null }) : task));
+      assert.deepEqual(cleaned.prepare("SELECT * FROM bindings").all(), beforeBindings);
+      const running = tasks.find(task => task.state === "running");
+      core.recordResult(cleaned, running.id, "reported", "New receipt");
+      assert.ok(cleaned.prepare("SELECT updated_at FROM tasks WHERE id = ?").get(running.id).updated_at > old);
+    } finally { cleaned.close(); }
+  } finally { await client.close(); }
 });
 
 test("late hooks and history cannot revive a dismissed task or replace a newer pending binding", async () => {
@@ -170,6 +243,8 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
     core.startDesktop = async uri => {
       const msg = new URL(uri).searchParams.get("prompt");
       const id = core.taskMarker.exec(msg)[1];
+      if (msg.includes("original") && !msg.includes("AGY_SUMMARY_BEGIN")) throw new Error("missing receipt instruction");
+      if (uri.length > 8000) throw new Error("oversized draft");
       if (seen.has(id) && seen.get(id) !== uri) throw new Error("different draft");
       seen.set(id, uri);
     };
@@ -187,7 +262,7 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
   const call = async (name, args) => {
     const response = await client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": "owner" } });
     assert.ok(!response.isError, JSON.stringify(response.content));
-    return response.structuredContent;
+    return response.structuredContent ?? JSON.parse(response.content[0].text);
   };
   try {
     const draft = await call("submit", { prompt: "original" });
@@ -206,5 +281,157 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
     const next = await call("submit", { prompt: "next" });
     assert.notEqual(next.task_id, draft.task_id);
     assert.equal((await call("status", args)).bound_workspace, null);
+    const nearLimit = await call("submit", { prompt: "x".repeat(7800), new_chat: true });
+    assert.equal(nearLimit.state, "awaiting_send");
+  } finally { await client.close(); }
+});
+
+test("MCP workspace search returns bounded read-only matches from the current workspace", async () => {
+  const workspace = path.join(scratch, "search-workspace");
+  const outside = path.join(scratch, "outside-search-workspace");
+  mkdirSync(workspace);
+  mkdirSync(outside);
+  const files = {
+    "README.md": "Installation\nSearchNeedle --pre=bad & literal\n",
+    "settings.ps1": "# Setup\nSearchNeedle\n",
+    ".gitignore": "ignored.md\n",
+    ".ignore": "!.hidden.md\n",
+    ".hidden.md": "HiddenNeedle\n",
+    "ignored.md": "SearchNeedle\n",
+    ".env.local": "SearchNeedle\n",
+    "access.pem": "SearchNeedle\n",
+    "package-lock.json": "SearchNeedle\n",
+    "Dockerfile": "FROM alpine\nRUN echo SearchNeedle\n",
+    "rg.exe": "Workspace files must not be used as executables.\n",
+    "many.txt": `Bounded ${"x".repeat(1000)}\n`.repeat(25),
+  };
+  for (const [file, content] of Object.entries(files)) writeFileSync(path.join(workspace, file), content);
+  mkdirSync(path.join(workspace, ".github"));
+  writeFileSync(path.join(workspace, ".github", "pipeline.xml"), "start\nSearchNeedle\nend\n");
+  const outsideFile = path.join(outside, "outside.md");
+  const rgConfig = path.join(outside, "rg-config");
+  writeFileSync(outsideFile, "SearchNeedle\n");
+  writeFileSync(rgConfig, "--no-ignore\n--follow\n");
+  symlinkSync(outside, path.join(workspace, "outside-link"), "junction");
+  const before = readdirSync(workspace).sort();
+
+  const client = new Client({ name: "search-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: [path.join(root, "mcp.cjs"), ".", ":memory:", "unused"], cwd: workspace,
+    env: { ...process.env, RIPGREP_CONFIG_PATH: rgConfig },
+  });
+  await client.connect(transport);
+  const call = async (args) => {
+    const response = await client.callTool({ name: "search_workspace", arguments: args });
+    assert.ok(!response.isError, JSON.stringify(response.content));
+    assert.equal(response.structuredContent, undefined);
+    return JSON.parse(response.content[0].text);
+  };
+  try {
+    const listed = await call({ mode: "files", query: "readme" });
+    assert.deepEqual(listed.matches, [{ path: "README.md" }]);
+    const all = await call({ mode: "files" });
+    assert.ok(!all.matches.some(({ path }) => /ignored\.md|\.env\.local|access\.pem|package-lock|outside-link/.test(path)));
+    assert.ok(all.matches.some(({ path }) => path === ".github/pipeline.xml"));
+    assert.deepEqual((await call({ mode: "files", path: ".github", glob: "*.xml" })).matches, [{ path: ".github/pipeline.xml" }]);
+    assert.deepEqual((await call({ mode: "files", path: "ignored.md", glob: "*.md" })).matches, []);
+    const docs = await call({ mode: "docs", query: "searchneedle" });
+    assert.deepEqual(docs.matches, [{ path: "README.md", line: 2, text: "SearchNeedle --pre=bad & literal" }]);
+    assert.deepEqual((await call({ mode: "docs", query: "--pre=bad & literal" })).matches, docs.matches);
+    const code = await call({ mode: "code", query: "SearchNeedle" });
+    assert.deepEqual(code.matches.map(match => match.path).sort(), [".github/pipeline.xml", "Dockerfile", "settings.ps1"]);
+    const text = await call({ mode: "text", query: "SearchN[e]+dle", regex: true, whole_word: true,
+      case_sensitive: true, path: ".github", context_lines: 1 });
+    assert.deepEqual(text.matches, [{ path: ".github/pipeline.xml", line: 2, text: "SearchNeedle",
+      context: [{ line: 1, text: "start" }, { line: 3, text: "end" }] }]);
+    assert.deepEqual((await call({ mode: "docs", query: "searchneedle", case_sensitive: true })).matches, []);
+    const bounded = await call({ mode: "docs", query: "Bounded", limit: 4, per_file: 8 });
+    assert.equal(bounded.truncated, true);
+    assert.equal(bounded.matches.length, 4);
+    assert.equal((await call({ mode: "docs", query: "Bounded" })).matches.length, 3);
+    assert.ok(bounded.matches.every(({ text }) => text.length <= 302));
+    for (const args of [{ mode: "files", command: "write" }, { mode: "files", path: "../" },
+      { mode: "files", glob: "README\u0000.md" }, { mode: "docs", query: "a\nb" },
+      { mode: "files", path: outside }, { mode: "files", path: "outside-link" },
+      { mode: "docs", query: "(?=test)", regex: true }]) {
+      assert.equal((await client.callTool({ name: "search_workspace", arguments: args })).isError, true);
+    }
+    assert.deepEqual(readdirSync(workspace).sort(), before);
+    for (const [file, content] of Object.entries(files)) assert.equal(readFileSync(path.join(workspace, file), "utf8"), content);
+    assert.equal(readFileSync(outsideFile, "utf8"), "SearchNeedle\n");
+  } finally { await client.close(); }
+});
+
+test("MCP status and watch keep receipts compact and recent replies stay inside the current binding", async () => {
+  const statePath = path.join(scratch, "receipts.sqlite");
+  const db = core.openDatabase(statePath);
+  const thread = randomUUID();
+  const otherThread = randomUUID();
+  const summary = "已完成设置更新。\n验证通过。\n待用户确认：无。";
+  const report = `AGY_SUMMARY_BEGIN\n${summary}\nAGY_SUMMARY_END\n${"details ".repeat(300)}`;
+  const oldReport = `结果 ${"old ".repeat(600)} 末尾验证`;
+  const task = insertTask(db, "reported", "task-owner", thread);
+  const legacy = insertTask(db, "reported", "task-owner", thread);
+  db.prepare("UPDATE tasks SET report=? WHERE id=?").run(report, task);
+  db.prepare("UPDATE tasks SET report=? WHERE id=?").run(oldReport, legacy);
+  core.bindThread(db, "history-owner", thread);
+  core.bindThread(db, "other-owner", otherThread);
+  db.close();
+  const program = `
+    const core = require("./core.cjs");
+    core.CodexReader = class { close() {} async read(method, params) {
+      if (method !== "thread/turns/list" || params.itemsView !== "summary" || params.limit !== 8) throw new Error("unexpected read");
+      if (params.threadId === ${JSON.stringify(otherThread)}) return { data: [] };
+      if (params.threadId !== ${JSON.stringify(thread)}) throw new Error("unexpected thread");
+      if (!params.cursor) return { nextCursor: "older", data: [{id:"interrupted",status:"interrupted",items:[{type:"agentMessage",phase:"final_answer",text:"partial"}]}] };
+      return { data: [
+        { id:"newest", status:"completed", items:[{type:"userMessage",content:[{type:"text",text:"question ".repeat(100)}]},
+          {type:"commandExecution",text:"private log"},{type:"agentMessage",phase:"commentary",text:"private commentary"},
+          {type:"agentMessage",phase:"final_answer",text:"answer ".repeat(200)}]},
+        { id:"older", status:"completed", items:[{type:"agentMessage",phase:"final_answer",text:${JSON.stringify(report)}}]},
+        { id:"at-limit", status:"completed", items:[{type:"agentMessage",phase:"final_answer",text:"x".repeat(1200)}]},
+      ] };
+    } };
+    process.argv = ["node", "mcp", process.cwd(), ${JSON.stringify(statePath)}, "unused"];
+    import("./src/mcp-entry.mjs");
+  `;
+  const client = new Client({ name: "receipts-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root });
+  await client.connect(transport);
+  const invoke = (name, args, owner) => client.callTool({ name, arguments: args,
+    _meta: { "antigravity.google/root_conversation_id": owner } });
+  const call = async (name, args, owner = "task-owner") => {
+    const response = await invoke(name, args, owner);
+    assert.ok(!response.isError, JSON.stringify(response.content));
+    return JSON.parse(response.content[0].text);
+  };
+  try {
+    const status = await call("status", { task_id: task });
+    assert.equal(status.has_report, true);
+    assert.equal(status.report, undefined);
+    const watched = await call("watch", { task_id: task });
+    assert.equal(watched.report, summary);
+    assert.equal(watched.report_kind, "summary");
+    assert.equal((await invoke("watch", { task_id: task }, "task-owner")).structuredContent, undefined);
+    assert.equal((await call("status", { task_id: task, report_mode: "summary" })).report, summary);
+    assert.equal((await call("status", { task_id: task, report_mode: "full" })).report, report);
+    const old = await call("watch", { task_id: legacy });
+    assert.equal(old.report_kind, "excerpt");
+    assert.equal(old.report_truncated, true);
+    assert.ok(old.report.length <= 1200 && old.report.endsWith("末尾验证"));
+    assert.equal((await call("status", {}, "history-owner")).state, "no_task");
+    const history = await call("recent_replies", {}, "history-owner");
+    assert.deepEqual(history.replies.map(item => item.turn_id), ["newest", "older", "at-limit"]);
+    assert.ok(history.replies[0].user.length <= 240);
+    assert.equal(history.replies[0].reply.length, 1200);
+    assert.equal(history.replies[0].reply_truncated, true);
+    assert.equal(history.replies[1].reply, summary);
+    assert.equal(history.replies[1].reply_is_summary, true);
+    assert.equal(history.replies[2].reply.length, 1200);
+    assert.equal(history.replies[2].reply_truncated, false);
+    assert.equal((await call("recent_replies", { limit: 1 }, "history-owner")).replies.length, 1);
+    assert.deepEqual((await call("recent_replies", {}, "other-owner")).replies, []);
+    assert.equal((await invoke("recent_replies", {}, "unbound")).isError, true);
+    assert.equal((await invoke("recent_replies", { thread_id: otherThread }, "history-owner")).isError, true);
   } finally { await client.close(); }
 });

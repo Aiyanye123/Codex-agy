@@ -44,7 +44,7 @@ Run the installer once from the folder containing `Install.ps1`. The repository 
 
 Global installation applies to the current Windows user. You can then start `codex-agy` from any working folder. Keep the bridge's installation folder in place because Antigravity references files there.
 
-To upgrade, update the bridge files in the same folder and rerun the original install command, then restart Antigravity. The installer refreshes its own agent and MCP settings and keeps other MCP servers. If it detects an edited agent or a conflicting server, it stops and shows the file to review.
+To upgrade, update the bridge files in the same folder and rerun the original install command, then restart Antigravity. If you also installed the bridge in a workspace, rerun its workspace install command too. The installer refreshes its own agent and MCP settings and keeps other MCP servers. If it detects an edited agent or a conflicting server, it stops and shows the file to review.
 
 ### Ask an agent to install it
 
@@ -91,7 +91,8 @@ After Gemini confirms the binding and working folder, give Antigravity a task. S
 | What you want | What to do |
 | --- | --- |
 | Check which chat is bound | Ask “Which Codex chat is bound?” |
-| Check the latest task | Say “Check the result” or “Continue.” You can also specify a task ID. |
+| Check progress or results | Say “Check progress” for status, “Check the result” for the receipt summary, or “Show the full receipt” for the original reply. You can specify a task ID. |
+| Review a bound chat | Ask what you last discussed in the bound Codex chat. The bridge returns up to six completed replies, each with a short question excerpt and reply. |
 | See recent tasks | Ask “List my tasks.” The list includes IDs, states, folders and UTC timestamps. Historical times that were never recorded appear as unknown. |
 | Reopen an unsent first task | Say “Resume draft” with the task ID. The bridge keeps the draft text locally until it is accepted or dismissed. Click Send in only one window. Older drafts without saved text can be sent from the original window. |
 | Abandon a draft or stop tracking | Give the task ID and say “Abandon this draft” or “Stop tracking.” Close any abandoned draft in the app. A task already sent to Codex can keep running. |
@@ -102,11 +103,13 @@ After Gemini confirms the binding and working folder, give Antigravity a task. S
 
 Bindings are saved per Antigravity conversation. Conversations started from the same folder can target different Codex chats.
 
+With `rg.exe` on PATH, Gemini can search files, documents, code and configuration, or all text in the current Antigravity workspace. Try “Find references to `queueTask` under `src/` in `*.mjs` files.” Search supports a relative path, glob, case and whole-word matching, optional regular expressions, and up to two lines of context. Git-ignored files, symbolic links, common credentials, and lockfiles are skipped. Hidden project configuration such as `.github/` is searchable. A bound Codex chat in a different folder retains its own working directory. Ask Codex to inspect that folder or review lengthy material.
+
 ## Completion, files, and local data
 
 - **Waiting and reporting.** While the Antigravity conversation is open, Gemini can wait for a reply in the background for up to an hour at a time. Gemini checks the Codex reply against your request, follows up on gaps, and summarizes the outcome. It can consult a document or a named result file when needed. It can follow up on routine work you already authorized. It will ask about scope changes, material decisions, or approvals in Codex App. If you exit Antigravity, resume the original conversation and say “Check the result.”
 - **Images and files.** Save the material in a local folder Codex can access and include the full path in your request, such as `C:\Work\MyProject\reference.png`. The bridge carries text tasks and replies. Files stay on your computer, and Codex can read them by path. To attach an image directly to a chat, add it in Codex App.
-- **Configuration and records.** Global configuration lives under `%USERPROFILE%\.gemini\config\`. Bindings, task state, and text replies are stored in `.state\bridge.sqlite` under the installation folder by default. The bridge starts with Antigravity and requires no separate startup service. Antigravity and Codex still use their respective model services to process tasks.
+- **Configuration and records.** Global configuration lives under `%USERPROFILE%\.gemini\config\`. Bindings, task state, and text replies are stored in `.state\bridge.sqlite` under the installation folder by default. On startup, the bridge clears local reply text from finished tasks last updated over 30 days ago. Task records and bindings are kept. The bridge starts with Antigravity and requires no separate startup service. Antigravity and Codex still use their respective model services to process tasks.
 
 ## Troubleshooting
 

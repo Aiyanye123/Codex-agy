@@ -1,11 +1,21 @@
 import core from "../core.cjs";
 import { setTimeout as delay } from "node:timers/promises";
+import { finalMessage } from "./receipt.mjs";
 
 const { markAccepted, recordResult, taskMarker, transaction } = core;
 
 // Both dispatch commands time out within 15 s. Give other processes time to record their result.
 export const dispatchLeaseMs = 30_000;
 export const ongoing = new Set(["dispatching", "dispatch_unknown", "awaiting_send", "queued", "running"]);
+
+export function clearExpiredReports(database) {
+  const nonterminal = [...ongoing];
+  database.prepare(`
+    UPDATE tasks SET report = NULL
+    WHERE report IS NOT NULL AND state NOT IN (${nonterminal.map(() => "?").join(", ")})
+      AND julianday(coalesce(updated_at, created_at)) < julianday('now', '-30 days')
+  `).run(...nonterminal);
+}
 
 export function dismissTask(database, owner, id) {
   return transaction(database, () => {
@@ -115,9 +125,7 @@ async function observeResult(database, reader, task) {
     } else if (turn.status === "interrupted" && (turn.completedAt != null || turn.durationMs != null)) {
       recordResult(database, task.id, "interrupted", null, "Codex 回合已中止。");
     } else if (turn.status === "completed") {
-      const messages = turn.items.filter((item) => item.type === "agentMessage" && item.text?.trim());
-      const answer = messages.findLast((item) => item.phase === "final_answer")
-        ?? messages.findLast((item) => item.phase == null);
+      const answer = finalMessage(turn);
       if (answer) recordResult(database, task.id, "reported", answer.text);
       else recordResult(database, task.id, "no_report", null, "Codex 回合已完成，记录中没有最终文字回复。");
     }
