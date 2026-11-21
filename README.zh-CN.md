@@ -44,6 +44,8 @@ Set-Location .\Codex-agy
 
 全局安装只对当前 Windows 用户生效。之后可以在任意工作目录启动 `codex-agy`，无需在每个项目重新安装。请保留桥接程序的安装目录，Antigravity 配置会引用其中的文件。
 
+升级时，在原目录更新桥接文件，重新执行原来的安装命令，然后重启 Antigravity。安装器会更新托管的角色和 MCP 设置，保留其他 MCP 服务。遇到手动修改的角色或同名服务冲突，会停下并提示需要核对的文件。
+
 ### 让 Agent 帮你安装
 
 把下面整段发给能操作 Windows 终端的 Agent，例如 Codex App。
@@ -90,6 +92,9 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | --- | --- |
 | 看当前绑在哪个会话 | 在 Antigravity 说「现在绑定的是哪个 Codex 会话？」 |
 | 查最近的任务 | 说「查结果」或「继续」。有工单 ID 时也可以指定该工单。 |
+| 查看近期工单 | 说「列出我的任务」，可看到工单 ID、状态、目录和 UTC 时间。旧记录未保存的时间显示为未知。 |
+| 恢复未发送的首单 | 说「恢复草稿」并给出工单 ID。桥接在本地暂存草稿正文，接单或放弃时清除。只在一个窗口点发送。没有保存正文的旧草稿仍可从原窗口发送。 |
+| 放弃草稿或停止跟踪 | 指定工单说「放弃草稿」或「停止跟踪」。请关闭 App 中已放弃的草稿；已发送的任务仍可能继续执行。 |
 | 换成另一个已有会话 | 发送新的 Codex 会话链接并要求绑定。 |
 | 解除当前绑定 | 说「取消绑定」或「解绑」。已派发的工单仍可查询。 |
 | 改用一个新会话 | 说「新开一个 Codex 会话处理」，到 App 发送预填的首条任务。 |
@@ -99,7 +104,7 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 
 ## 完成通知、文件和本地数据
 
-- **等待与汇报。** 保持 Antigravity 对话打开，Gemini 会后台等待回执，每次最多一小时。收到回执后，Gemini 会结合原任务、Codex 的回复及有权限读取的产物验收。常规且已授权的细节可以直接跟进。涉及范围变更、重要取舍或 Codex App 审批时，Gemini 会请你处理。退出 Antigravity 后，可恢复原对话并说「查结果」。
+- **等待与汇报。** 保持 Antigravity 对话打开，Gemini 会后台等待回执，每次最多一小时。收到回执后，Gemini 会对照原需求核对 Codex 的回执、追问遗漏，再用简体中文汇报。需要核对文档或明确提及的结果文件时，才按路径读取。常规且已授权的细节可以直接跟进。涉及范围变更、重要取舍或 Codex App 审批时，Gemini 会请你处理。退出 Antigravity 后，可恢复原对话并说「查结果」。
 - **图片和文件。** 把材料保存到 Codex 能访问的本机目录，在请求中写清完整路径，例如 `C:\Work\MyProject\reference.png`。桥接当前传递文本工单和回执，文件留在本机，Codex 按路径读取。需要把图片作为原生附件时，可以在 Codex App 手动添加。
 - **配置和记录。** 全局配置位于 `%USERPROFILE%\.gemini\config\`，绑定、任务状态和文字回执默认保存在安装目录的 `.state\bridge.sqlite`。桥接随 Antigravity 启动，无需单独设置开机自启。任务内容仍由 Antigravity 和 Codex 各自的模型服务处理。
 
@@ -111,6 +116,6 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | 执行策略阻止 ZIP 中的脚本 | 确认 ZIP 来自本仓库并审阅 `Install.ps1` 后，在桥接目录运行 `Unblock-File -LiteralPath .\Install.ps1`，再执行安装。 |
 | `Get-Command codex.exe` 找不到命令，或 `queue` 不可用 | 按上面的官方指南安装或更新 Windows 版 Codex CLI，再打开新终端确认。 |
 | Codex 做完了，Antigravity 还没汇报 | 在原对话说「查结果」。如果刚创建的会话仍在等待发送，到 Codex App 发送预填任务。如果仍显示运行中，查看 Codex App 是否在等审批。 |
-| 是否需要启用 Codex 钩子 | 日常完成汇报由 Antigravity 后台等待提供，已配置的 `AGY Codex Bridge` 钩子可以在 Codex App 中关闭。项目钩子可更早记录接单和完成。当前版本还通过钩子记录手动中断。如果需要这些事件，可运行 `.\Install.ps1 -Workspace <项目目录>` 配置，再在 Codex App 中启用。 |
+| 是否需要启用 Codex 钩子 | 日常完成汇报由 Antigravity 后台等待提供，已配置的 `AGY Codex Bridge` 钩子可以在 Codex App 中关闭。项目钩子可更早记录接单和完成。当前版本还通过钩子记录手动中断。全局安装后，可在桥接安装目录运行 `.\Install.ps1 -Workspace 'C:\Work\MyProject' -HooksOnly`，把路径换成你的项目，再到 Codex App 审查并启用。此模式只安装项目钩子。如果全局安装用了自定义 `-StateDirectory`，这里也要指定同一路径。 |
 
 第三方依赖的许可声明见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。

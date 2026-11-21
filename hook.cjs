@@ -16,6 +16,7 @@ function collect(database, workspace, event) {
     return transaction(database, () => {
       const task = database.prepare("SELECT * FROM tasks WHERE id = ?").get(marker[1].toLowerCase());
       if (!task || !sameWorkspace(task.workspace, workspace)) return;
+      if (task.state === "cancelled" || task.state === "dismissed") return;
       if ((task.thread_id && task.thread_id !== threadId) || (task.turn_id && task.turn_id !== turnId)) {
         return { decision: "block", reason: "这条桥接任务已经关联到另一条会话或回合，请从 Antigravity 查询原任务。" };
       }

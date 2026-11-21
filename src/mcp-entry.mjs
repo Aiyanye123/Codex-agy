@@ -4,18 +4,21 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import core from "../core.cjs";
+import {
+  bindingStatus, dismissTask, dispatchLeaseMs, listTasks, ongoing, readWithRetry, refreshTask, validateFollowUp,
+} from "./task-state.mjs";
 
 const {
-  bindThread, CodexReader, markAccepted, openDatabase, queueTask, recordResult,
-  startDesktop, taskMarker, threadIdFrom, transaction, workspacePath,
+  bindThread, CodexReader, openDatabase, queueTask,
+  startDesktop, threadIdFrom, transaction, workspacePath,
 } = core;
 const [, , directory, statePath, codex] = process.argv;
 const workspace = workspacePath(directory);
 const database = openDatabase(statePath);
 const reader = new CodexReader(codex);
 const server = new McpServer({ name: "agy-codex-bridge", version: "0.1.0" });
-const ongoing = new Set(["dispatching", "dispatch_unknown", "awaiting_send", "queued", "running"]);
 const watching = new Set();
+const activeDispatches = new Set();
 
 function conversationOwner(context) {
   const owner = context._meta?.["antigravity.google/root_conversation_id"];
@@ -33,7 +36,7 @@ function reply(data) {
   return { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data };
 }
 
-function reportStatus(task, watchState) {
+function reportStatus(task, watchState, extra = {}) {
   const binding = database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(task.owner);
   return reply({
     task_id: task.id,
@@ -44,9 +47,12 @@ function reportStatus(task, watchState) {
     turn_id: task.turn_id,
     report: task.report,
     detail: task.detail,
+    created_at: task.created_at,
+    updated_at: task.updated_at,
     bound_thread_id: binding?.thread_id ?? null,
-    can_follow_up: Boolean(task.thread_id && task.thread_id === binding?.thread_id),
+    can_follow_up: Boolean(task.thread_id && task.thread_id === binding?.thread_id && !["dismissed","cancelled"].includes(task.state)),
     ...(watchState && { watch_state: watchState }),
+    ...extra,
   });
 }
 
@@ -56,75 +62,56 @@ async function readThread(threadId) {
   return { directory: workspacePath(thread.cwd), name: thread.name ?? null };
 }
 
-function createTask(owner, prompt, newChat, target) {
+function draftUri(directory, message) {
+  const uri = `codex://threads/new?${new URLSearchParams({ path: directory, prompt: message })}`;
+  if (uri.length > 8000) throw new Error("首单超过桌面链接的长度上限。请压缩工单，把长材料留在工作目录并引用文件。");
+  return uri;
+}
+
+function createTask(owner, prompt, target, explicitNewChat) {
   const id = randomUUID();
   const message = `[AGY Codex task: ${id}]\n\n${prompt}`;
-  let uri;
-  if (newChat) {
-    const parameters = new URLSearchParams({ path: workspace, prompt: message });
-    uri = `codex://threads/new?${parameters}`;
-    if (uri.length > 8000) throw new Error("首单超过桌面链接的长度上限。请压缩工单，把长材料留在工作目录并引用文件。");
-  }
-  transaction(database, () => {
+  return transaction(database, () => {
+    const binding = database.prepare("SELECT * FROM bindings WHERE owner = ?").get(owner);
+    if (!explicitNewChat && (binding?.thread_id ?? null) !== target.threadId) {
+      throw new Error("当前绑定在派单前发生了变化，请确认目标会话。");
+    }
+    if (!explicitNewChat && binding?.pending_task_id) {
+      const pending = taskById(owner, binding.pending_task_id);
+      if (pending && ongoing.has(pending.state)) return { pending };
+    }
+    const newChat = !target.threadId;
+    const uri = newChat ? draftUri(target.directory, message) : null;
     database.prepare(`
-      INSERT INTO tasks (id, owner, workspace, thread_id, state)
-      VALUES (?, ?, ?, ?, 'dispatching')
-    `).run(id, owner, target.directory, target.threadId);
+      INSERT INTO tasks (id, owner, workspace, thread_id, state, dispatch_deadline, draft_prompt)
+      VALUES (?, ?, ?, ?, 'dispatching', ?, ?)
+    `).run(id, owner, target.directory, target.threadId, Date.now() + dispatchLeaseMs, newChat ? message : null);
     if (newChat) {
       database.prepare(`
         INSERT INTO bindings (owner, pending_task_id) VALUES (?, ?)
         ON CONFLICT(owner) DO UPDATE SET thread_id = NULL, pending_task_id = excluded.pending_task_id
       `).run(owner, id);
     }
-  });
-  return { id, message, uri };
-}
-
-async function observeResult(task) {
-  if (!task.thread_id) {
-    const { data: threads } = await reader.read("thread/list", {
-      cwd: task.workspace, limit: 12, modelProviders: [], sourceKinds: ["cli", "vscode", "appServer", "unknown"],
-    });
-    const marker = `[AGY Codex task: ${task.id}]`;
-    const matchingThreads = threads.filter((thread) => thread.preview?.startsWith(marker));
-    if (matchingThreads.length !== 1) return;
-    task = { ...task, thread_id: matchingThreads[0].id };
-  }
-  const { data: turns } = await reader.read("thread/turns/list", {
-    threadId: task.thread_id, limit: 20, sortDirection: "desc", itemsView: "full",
-  });
-  const turn = turns.find(({ id, items }) => task.turn_id ? id === task.turn_id :
-    items.some((item) => item.type === "userMessage" && item.content.some((input) =>
-      input.type === "text" && taskMarker.exec(input.text)?.[1]?.toLowerCase() === task.id)));
-  if (!turn) return;
-
-  const final = turn.items.findLast((item) => item.type === "agentMessage" && item.phase === "final_answer");
-  const unphased = turn.status === "completed" && turn.items.findLast(
-    (item) => item.type === "agentMessage" && item.phase == null,
-  );
-  transaction(database, () => {
-    markAccepted(database, task.id, task.thread_id, turn.id);
-    if (turn.status === "failed") {
-      recordResult(database, task.id, "failed", null, turn.error?.message ?? "Codex 回合失败。");
-    } else if (final?.text?.trim() || unphased?.text?.trim()) {
-      recordResult(database, task.id, "reported", (final ?? unphased).text);
-    } else if (turn.status === "completed") {
-      recordResult(database, task.id, "no_report", null, "Codex 回合已完成，记录中没有最终文字回复。");
-    }
+    return { id, message, uri };
   });
 }
 
 async function waitForResult(owner, taskId, waitSeconds, interval, signal) {
   const deadline = Date.now() + waitSeconds * 1000;
+  const historyReader = { read: (method, params) => readWithRetry(reader, method, params, taskId, signal) };
   do {
     signal.throwIfAborted();
     let task = taskById(owner, taskId);
     if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
     if (!ongoing.has(task.state)) return task;
-    if (task.state !== "dispatching") {
-      await observeResult(task);
-      task = taskById(owner, taskId);
+    try {
+      await refreshTask(database, historyReader, task, activeDispatches);
+    } catch (error) {
+      const latest = taskById(owner, taskId);
+      if (latest && !ongoing.has(latest.state)) return latest;
+      throw error;
     }
+    task = taskById(owner, taskId);
     const remaining = deadline - Date.now();
     if (!ongoing.has(task.state) || remaining <= 0) return task;
     await delay(Math.min(interval, remaining), undefined, { signal });
@@ -165,22 +152,25 @@ server.registerTool("submit", {
   inputSchema: {
     prompt: z.string().trim().min(1).max(12000),
     new_chat: z.boolean().optional(),
+    follow_up_task_id: z.string().uuid().optional().describe("补单时传原工单 ID，以核对投递目标。"),
   },
-}, async ({ prompt, new_chat: newChat }, context) => {
+}, async ({ prompt, new_chat: newChat, follow_up_task_id: followUpTaskId }, context) => {
   const owner = conversationOwner(context);
   const binding = database.prepare("SELECT * FROM bindings WHERE owner = ?").get(owner);
-  const threadId = newChat ? null : binding?.thread_id ?? null;
-  if (!newChat && binding?.pending_task_id) {
-    const pending = taskById(owner, binding.pending_task_id);
-    if (pending && ongoing.has(pending.state)) return reportStatus(pending);
-  }
+  let threadId = newChat ? null : binding?.thread_id ?? null;
+  if (followUpTaskId) threadId = validateFollowUp(database, owner, followUpTaskId, newChat);
   const actualWorkspace = threadId ? (await readThread(threadId)).directory : workspace;
-  if (threadId && database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner)?.thread_id !== threadId) {
-    throw new Error("当前绑定在派单前发生了变化，请确认目标会话。");
+  const task = createTask(owner, prompt, { directory: actualWorkspace, threadId }, newChat);
+  if (task.pending) {
+    return reportStatus(task.pending, null, {
+      new_task_dispatched: false,
+      detail: "未派发本次新单。当前对话已有未结束的首单，请查询、恢复或放弃原单。"
+        + (task.pending.detail ?? ""),
+    });
   }
-  const task = createTask(owner, prompt, !threadId, { directory: actualWorkspace, threadId });
   let state = threadId ? "queued" : "awaiting_send";
   let detail = threadId ? "已入队，等待 Codex App 领取。" : "请在 Codex App 审核预填工单并点发送。";
+  activeDispatches.add(task.id);
   try {
     if (threadId) await queueTask(codex, actualWorkspace, threadId, task.message);
     else await startDesktop(task.uri);
@@ -188,9 +178,12 @@ server.registerTool("submit", {
     state = threadId || error.killed ? "dispatch_unknown" : "dispatch_failed";
     const reason = error.killed ? "本机调度超时。" : error.stderr?.trim().slice(0, 500) || error.code;
     detail = `调度未确认：${reason ?? "进程返回错误"}。请先查看原任务，避免重复派单。`;
+  } finally {
+    activeDispatches.delete(task.id);
   }
   database.prepare(`
-    UPDATE tasks SET state = ?, detail = ? WHERE id = ? AND state = 'dispatching'
+    UPDATE tasks SET state = ?, detail = ?, dispatch_deadline = NULL
+    WHERE id = ? AND state IN ('dispatching', 'dispatch_unknown')
   `).run(state, detail, task.id);
   return reportStatus(taskById(owner, task.id));
 });
@@ -205,16 +198,50 @@ server.registerTool("status", {
   const owner = conversationOwner(context);
   taskId ??= database.prepare("SELECT id FROM tasks WHERE owner = ? ORDER BY rowid DESC LIMIT 1").get(owner)?.id;
   if (!taskId) {
-    const binding = database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner);
+    const binding = await bindingStatus(database, owner, readThread);
     return reply({
       state: "no_task",
-      thread_id: binding?.thread_id ?? null,
-      bound_thread_id: binding?.thread_id ?? null,
+      thread_id: binding.bound_thread_id,
+      ...binding,
       new_chat_workspace: workspace,
       detail: "当前对话还没有派单。",
     });
   }
-  return reportStatus(await waitForResult(owner, taskId, waitSeconds, 2000, context.signal));
+  await waitForResult(owner, taskId, waitSeconds, 2000, context.signal);
+  const binding = await bindingStatus(database, owner, readThread);
+  return reportStatus(taskById(owner, taskId), null, binding);
+});
+
+server.registerTool("list_tasks", {
+  description: "列出当前对话最近的工单，包含状态、工作目录、时间与简要说明。",
+  inputSchema: { limit: z.number().int().min(1).max(100).default(10) },
+}, async ({ limit }, context) => reply({ tasks: listTasks(database, conversationOwner(context), limit) }));
+
+server.registerTool("dismiss", {
+  description: "用户明确要求放弃草稿或停止跟踪时使用。仅停止本地跟踪，不代表 Codex App 已撤回执行。",
+  inputSchema: { task_id: z.string().uuid() },
+}, async ({ task_id: id }, context) => {
+  const owner = conversationOwner(context);
+  dismissTask(database, owner, id);
+  return reportStatus(taskById(owner, id));
+});
+
+server.registerTool("resume_draft", {
+  description: "用户明确要求恢复未发送的首单时，在原目录重新打开带原标记的草稿，仍需手动发送。",
+  inputSchema: { task_id: z.string().uuid() },
+}, async ({ task_id: id }, context) => {
+  const owner = conversationOwner(context);
+  const task = await waitForResult(owner, id, 0, 0, context.signal);
+  const binding = database.prepare("SELECT pending_task_id FROM bindings WHERE owner = ?").get(owner);
+  if (task.state !== "awaiting_send" || binding?.pending_task_id !== id) {
+    throw new Error("只能恢复当前绑定中尚待发送的草稿。");
+  }
+  if (task.detail?.includes("无法唯一匹配")) throw new Error(task.detail);
+  if (!task.draft_prompt) throw new Error("旧版草稿没有保存正文。请在 App 发送原草稿，或放弃后重新派单。");
+  await startDesktop(draftUri(task.workspace, task.draft_prompt));
+  return reportStatus(taskById(owner, id), null, {
+    new_task_dispatched: false, detail: "已重新打开原草稿，请只在一个窗口点击发送。",
+  });
 });
 
 server.registerTool("watch", {
