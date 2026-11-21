@@ -121,4 +121,6 @@ With `rg.exe` on PATH, Gemini can search files, documents, code and configuratio
 | Codex finished but Antigravity is quiet | Say “Check the result” in the original conversation. If a new chat is waiting for the draft to be sent, send it in Codex App. If the task still appears to be running, check the app for a pending approval. |
 | You're wondering whether to enable Codex hooks | Antigravity's background wait handles normal completion reports. You can disable existing `AGY Codex Bridge` hooks in Codex App. Project hooks can record acceptance and completion earlier, and the current version uses them to record manual interruptions. After a global install, run `.\Install.ps1 -Workspace 'C:\Work\MyProject' -HooksOnly` from the bridge folder, substituting your project path. This installs only the project hooks. Review and enable them in Codex App. If you set a custom `-StateDirectory`, use it here too. |
 
-See [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for third-party notices.
+## License
+
+Codex-agy is released under the [MIT License](LICENSE). See [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for third-party notices.

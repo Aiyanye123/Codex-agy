@@ -121,4 +121,6 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | Codex 做完了，Antigravity 还没汇报 | 在原对话说「查结果」。如果刚创建的会话仍在等待发送，到 Codex App 发送预填任务。如果仍显示运行中，查看 Codex App 是否在等审批。 |
 | 是否需要启用 Codex 钩子 | 日常完成汇报由 Antigravity 后台等待提供，已配置的 `AGY Codex Bridge` 钩子可以在 Codex App 中关闭。项目钩子可更早记录接单和完成。当前版本还通过钩子记录手动中断。全局安装后，可在桥接安装目录运行 `.\Install.ps1 -Workspace 'C:\Work\MyProject' -HooksOnly`，把路径换成你的项目，再到 Codex App 审查并启用。此模式只安装项目钩子。如果全局安装用了自定义 `-StateDirectory`，这里也要指定同一路径。 |
 
-第三方依赖的许可声明见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。
+## 开源协议
+
+Codex-agy 使用 [MIT 开源协议](LICENSE)。第三方依赖的许可声明见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。
