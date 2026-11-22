@@ -24,13 +24,15 @@ function collect(database, workspace, event) {
     });
   }
 
-  const task = database.prepare("SELECT id FROM tasks WHERE thread_id = ? AND turn_id = ?").get(threadId, turnId);
-  if (!task) return;
-  if (name === "Interrupt") {
-    recordResult(database, task.id, "interrupted", null, "Codex 回合已中止。");
-  } else if (event.last_assistant_message?.trim()) {
-    recordResult(database, task.id, "reported", event.last_assistant_message);
-  }
+  const interrupted = name === "Interrupt";
+  const report = interrupted ? null : event.last_assistant_message;
+  if (!interrupted && !report?.trim()) return;
+  const state = interrupted ? "interrupted" : "reported";
+  const detail = interrupted ? "Codex 回合已中止。" : null;
+  transaction(database, () => {
+    const tasks = database.prepare("SELECT id FROM tasks WHERE thread_id = ? AND turn_id = ?").all(threadId, turnId);
+    for (const { id } of tasks) recordResult(database, id, state, report, detail);
+  });
 }
 
 try {

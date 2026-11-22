@@ -39,6 +39,13 @@ export function listTasks(database, owner, limit) {
   `).all(owner, limit);
 }
 
+export function taskIdsForTurn(database, { owner, thread_id: threadId, turn_id: turnId }) {
+  if (!threadId || !turnId) return [];
+  return database.prepare(`
+    SELECT id FROM tasks WHERE owner = ? AND thread_id = ? AND turn_id = ? ORDER BY rowid ASC
+  `).all(owner, threadId, turnId).map(({ id }) => id);
+}
+
 export async function bindingStatus(database, owner, readThread) {
   const current = () => database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner)?.thread_id ?? null;
   const id = current();
@@ -87,6 +94,18 @@ export function validateFollowUp(database, owner, taskId, newChat) {
   return task.thread_id;
 }
 
+function markedTaskIds(turn) {
+  const ids = new Set();
+  for (const item of turn.items) {
+    if (item.type !== "userMessage") continue;
+    for (const input of item.content) {
+      const marker = input.type === "text" && taskMarker.exec(input.text);
+      if (marker) ids.add(marker[1].toLowerCase());
+    }
+  }
+  return ids;
+}
+
 async function observeResult(database, reader, task) {
   if (!task.thread_id) {
     const pages = historyPages(reader, "thread/list", {
@@ -111,23 +130,38 @@ async function observeResult(database, reader, task) {
   });
   let turn;
   for await (const turns of pages) {
-    turn = turns.find(({ id, items }) => task.turn_id ? id === task.turn_id :
-      items.some((item) => item.type === "userMessage" && item.content.some((input) =>
-        input.type === "text" && taskMarker.exec(input.text)?.[1]?.toLowerCase() === task.id)));
+    turn = turns.find(item => task.turn_id ? item.id === task.turn_id : markedTaskIds(item).has(task.id));
     if (turn) break;
   }
   if (!turn) return;
 
   transaction(database, () => {
     markAccepted(database, task.id, task.thread_id, turn.id);
+    // A steered prompt may be visible in history before its own watcher associates the task.
+    const unlinked = database.prepare(`
+      SELECT id FROM tasks WHERE id = ? AND owner = ? AND thread_id = ? AND turn_id IS NULL
+    `);
+    for (const id of markedTaskIds(turn)) {
+      if (id !== task.id && unlinked.get(id, task.owner, task.thread_id)) {
+        markAccepted(database, id, task.thread_id, turn.id);
+      }
+    }
+
+    let state, report = null, detail = null;
     if (turn.status === "failed") {
-      recordResult(database, task.id, "failed", null, turn.error?.message ?? "Codex 回合失败。");
+      state = "failed";
+      detail = turn.error?.message ?? "Codex 回合失败。";
     } else if (turn.status === "interrupted" && (turn.completedAt != null || turn.durationMs != null)) {
-      recordResult(database, task.id, "interrupted", null, "Codex 回合已中止。");
+      state = "interrupted";
+      detail = "Codex 回合已中止。";
     } else if (turn.status === "completed") {
-      const answer = finalMessage(turn);
-      if (answer) recordResult(database, task.id, "reported", answer.text);
-      else recordResult(database, task.id, "no_report", null, "Codex 回合已完成，记录中没有最终文字回复。");
+      report = finalMessage(turn)?.text ?? null;
+      state = report ? "reported" : "no_report";
+      if (!report) detail = "Codex 回合已完成，记录中没有最终文字回复。";
+    }
+    if (!state) return;
+    for (const id of taskIdsForTurn(database, { ...task, turn_id: turn.id })) {
+      recordResult(database, id, state, report, detail);
     }
   });
 }

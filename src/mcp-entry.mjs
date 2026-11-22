@@ -5,7 +5,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import core from "../core.cjs";
 import {
-  bindingStatus, clearExpiredReports, dismissTask, dispatchLeaseMs, listTasks, ongoing, readWithRetry, refreshTask, validateFollowUp,
+  bindingStatus, clearExpiredReports, dismissTask, dispatchLeaseMs, listTasks, ongoing, readWithRetry, refreshTask,
+  taskIdsForTurn, validateFollowUp,
 } from "./task-state.mjs";
 import { searchWorkspace } from "./workspace-search.mjs";
 import { excerpt, receiptInstruction, recentReplies, reportFields } from "./receipt.mjs";
@@ -24,6 +25,9 @@ const server = new McpServer({ name: "agy-codex-bridge", version: "0.1.0" }, {
 });
 const watching = new Set();
 const activeDispatches = new Set();
+const completedWatches = new Map();
+const completedWatchLimit = 1024;
+const codexTerminalStates = new Set(["reported", "no_report", "failed", "interrupted"]);
 
 function conversationOwner(context) {
   const owner = context._meta?.["antigravity.google/root_conversation_id"];
@@ -45,7 +49,7 @@ function textReply(data) {
   return { content: [{ type: "text", text: JSON.stringify(data) }] };
 }
 
-function reportStatus(task, watchState, extra = {}, reportMode = "none") {
+function reportStatus(task, watchState, extra = {}, reportMode = "none", turnTaskIds = taskIdsForTurn(database, task)) {
   const binding = database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(task.owner);
   const render = reportMode === "none" ? reply : textReply;
   return render({
@@ -55,6 +59,7 @@ function reportStatus(task, watchState, extra = {}, reportMode = "none") {
     thread_id: task.thread_id,
     thread_url: task.thread_id ? `codex://threads/${task.thread_id}` : null,
     turn_id: task.turn_id,
+    ...(turnTaskIds.length > 1 && { shared_turn_task_ids: turnTaskIds }),
     ...reportFields(task.report, reportMode),
     ...(task.state === "reported" && task.report === null && {
       report_note: "工单已完成。本地回执原文不可用。已完结工单的回执原文超过 30 天后会自动清理。",
@@ -67,6 +72,31 @@ function reportStatus(task, watchState, extra = {}, reportMode = "none") {
     ...(watchState && { watch_state: watchState }),
     ...extra,
   });
+}
+
+function completedWatch(task, signal) {
+  signal.throwIfAborted();
+  if (!task.thread_id || !task.turn_id || !codexTerminalStates.has(task.state)) {
+    return reportStatus(task, undefined, {}, "summary");
+  }
+
+  const turnTaskIds = taskIdsForTurn(database, task);
+  const key = JSON.stringify([task.owner, task.thread_id, task.turn_id]);
+  const reportedBy = completedWatches.get(key);
+  if (reportedBy && turnTaskIds.length > 1) {
+    return reportStatus(task, undefined, {
+      shared_turn_reported_by: reportedBy,
+      report_note: "同一 Codex 回合的结果已由其他等待通知返回，可查询工单读取回执。",
+    }, "none", turnTaskIds);
+  }
+
+  const result = reportStatus(task, undefined, {}, "summary", turnTaskIds);
+  // Keep the first result even if another task is only associated with this turn later.
+  if (!reportedBy) {
+    if (completedWatches.size >= completedWatchLimit) completedWatches.delete(completedWatches.keys().next().value);
+    completedWatches.set(key, task.id);
+  }
+  return result;
 }
 
 async function readThread(threadId) {
@@ -301,12 +331,13 @@ server.registerTool("watch", {
   const owner = conversationOwner(context);
   const task = taskById(owner, taskId);
   if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
-  if (!ongoing.has(task.state)) return reportStatus(task, undefined, {}, "summary");
+  if (!ongoing.has(task.state)) return completedWatch(task, context.signal);
   if (watching.has(taskId)) return reportStatus(task, "already_watching");
   watching.add(taskId);
   try {
     const result = await waitForResult(owner, taskId, 3600, 5000, context.signal);
-    return reportStatus(result, ongoing.has(result.state) ? "timed_out" : undefined, {}, "summary");
+    if (ongoing.has(result.state)) return reportStatus(result, "timed_out", {}, "summary");
+    return completedWatch(result, context.signal);
   } finally {
     watching.delete(taskId);
   }

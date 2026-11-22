@@ -11,7 +11,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import core from "../core.cjs";
 import { bindingStatus, dismissTask, listTasks, readWithRetry, refreshTask } from "../src/task-state.mjs";
 
-const root = fileURLToPath(new URL("../", import.meta.url));
+const root = core.workspacePath(fileURLToPath(new URL("../", import.meta.url)));
 const scratchRoot = path.join(root, ".state");
 let scratch;
 
@@ -164,6 +164,39 @@ test("late hooks and history cannot revive a dismissed task or replace a newer p
       assert.equal(task.state, "dismissed");
       assert.match(task.detail, /不代表 Codex App 已撤回执行/);
     }
+  } finally { db.close(); }
+});
+
+test("hooks associate multiple prompts with one turn and finish or interrupt all its tasks", () => {
+  const file = path.join(scratch, "shared-hooks.sqlite");
+  const db = core.openDatabase(file);
+  const thread = randomUUID();
+  const get = db.prepare("SELECT state, turn_id, report FROM tasks WHERE id = ?");
+  function hook(name, turn, payload = {}) {
+    const result = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning", "hook.cjs", file, root], {
+      cwd: root, encoding: "utf8",
+      input: JSON.stringify({ hook_event_name: name, cwd: root, session_id: thread, turn_id: turn, ...payload }),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "");
+  }
+
+  try {
+    const otherTurn = randomUUID();
+    const other = insertTask(db, "queued", "owner", thread);
+    core.markAccepted(db, other, thread, otherTurn);
+    for (const [event, state, report] of [["Stop", "reported", "finished"], ["Interrupt", "interrupted", null]]) {
+      const turn = randomUUID();
+      const first = insertTask(db, "queued", "owner", thread);
+      const second = insertTask(db, "queued", "owner", thread);
+      for (const id of [first, second]) {
+        hook("UserPromptSubmit", turn, { prompt: `[AGY Codex task: ${id}]\n\nwork` });
+        assert.deepEqual({ ...get.get(id) }, { state: "running", turn_id: turn, report: null });
+      }
+      hook(event, turn, { last_assistant_message: "finished" });
+      for (const id of [first, second]) assert.deepEqual({ ...get.get(id) }, { state, turn_id: turn, report });
+    }
+    assert.deepEqual({ ...get.get(other) }, { state: "running", turn_id: otherTurn, report: null });
   } finally { db.close(); }
 });
 
@@ -433,5 +466,85 @@ test("MCP status and watch keep receipts compact and recent replies stay inside 
     assert.deepEqual((await call("recent_replies", {}, "other-owner")).replies, []);
     assert.equal((await invoke("recent_replies", {}, "unbound")).isError, true);
     assert.equal((await invoke("recent_replies", { thread_id: otherThread }, "history-owner")).isError, true);
+  } finally { await client.close(); }
+});
+
+test("MCP watches share one terminal receipt per owner and turn while manual status can reread it", async () => {
+  const statePath = path.join(scratch, "shared-watches.sqlite");
+  const db = core.openDatabase(statePath);
+  const thread = randomUUID();
+  const turnId = randomUUID();
+  const original = insertTask(db, "queued", "owner", thread);
+  const steered = insertTask(db, "queued", "owner", thread);
+  const laterMarker = insertTask(db, "queued", "owner", thread);
+  const otherOwner = insertTask(db, "queued", "other-owner", thread);
+  for (const id of [original, steered, otherOwner]) core.markAccepted(db, id, thread, turnId);
+  const independent = [insertTask(db, "queued", "owner", thread), insertTask(db, "queued", "owner", thread)];
+  db.close();
+
+  const summary = "Shared work is complete.";
+  const report = `AGY_SUMMARY_BEGIN\n${summary}\nAGY_SUMMARY_END\nDetails for all prompts.`;
+  function turn(id, tasks, reportText) {
+    const prompts = tasks.map(task => ({ type: "userMessage", content: [{ type: "text", text: `[AGY Codex task: ${task}]\n\nwork` }] }));
+    return { id, status: "completed", items: [...prompts, { type: "agentMessage", phase: "final_answer", text: reportText }] };
+  }
+  const turns = [turn(turnId, [original, steered, laterMarker], report),
+    ...independent.map((id, index) => turn(randomUUID(), [id], `Independent receipt ${index}`))];
+  const program = `
+    const core = require("./core.cjs");
+    let release;
+    const ready = new Promise(resolve => { release = resolve; });
+    core.CodexReader = class { close() {} async read(method, params) {
+      if (params.threadId !== ${JSON.stringify(thread)}) throw new Error("unexpected thread");
+      if (method === "thread/read") { release(); return { thread: { id: params.threadId, cwd: process.cwd() } }; }
+      if (method !== "thread/turns/list") throw new Error("unexpected read");
+      await ready;
+      return { data: ${JSON.stringify(turns)} };
+    } };
+    process.argv = ["node", "mcp", process.cwd(), ${JSON.stringify(statePath)}, "unused"];
+    require("./mcp.cjs");
+  `;
+  const client = new Client({ name: "shared-watches-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root });
+  await client.connect(transport);
+  const call = async (name, args, owner = "owner") => {
+    const response = await client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": owner } });
+    assert.ok(!response.isError, JSON.stringify(response.content));
+    return JSON.parse(response.content[0].text);
+  };
+
+  try {
+    const firstWatch = call("watch", { task_id: steered });
+    const pending = await call("watch", { task_id: steered });
+    assert.equal(pending.watch_state, "already_watching");
+    assert.deepEqual(pending.shared_turn_task_ids, [original, steered]);
+    const otherWatches = [original, laterMarker].map(task_id => call("watch", { task_id }));
+    await call("bind", { session: thread });
+    const [first, ...duplicates] = await Promise.all([firstWatch, ...otherWatches]);
+    const sharedIds = [original, steered, laterMarker];
+    assert.equal(first.report_kind, "summary");
+    assert.equal(first.report, summary);
+    for (const result of [first, ...duplicates]) {
+      assert.equal(result.state, "reported");
+      assert.deepEqual(result.shared_turn_task_ids, sharedIds);
+    }
+    for (const result of duplicates) {
+      assert.equal(result.report, undefined);
+      assert.equal(result.has_report, true);
+      assert.equal(result.shared_turn_reported_by, steered);
+    }
+    for (const [mode, expected] of [["summary", summary], ["full", report]]) {
+      const status = await call("status", { task_id: original, report_mode: mode });
+      assert.equal(status.report, expected);
+      assert.deepEqual(status.shared_turn_task_ids, sharedIds);
+    }
+    const sameTurnOtherOwner = await call("watch", { task_id: otherOwner }, "other-owner");
+    assert.equal(sameTurnOtherOwner.report, summary);
+    assert.equal(sameTurnOtherOwner.shared_turn_task_ids, undefined);
+    for (const [index, task_id] of independent.entries()) {
+      const result = await call("watch", { task_id });
+      assert.equal(result.report, `Independent receipt ${index}`);
+      assert.equal(result.shared_turn_task_ids, undefined);
+    }
   } finally { await client.close(); }
 });
