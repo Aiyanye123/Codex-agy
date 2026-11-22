@@ -2,4 +2,7 @@
 /.state/
 /.agents/mcp_config.json
 /.agents/agents/codex-agy/
+/.agents/agents/codex-agy.md
+/.agents/agents/agydex/
+/.agents/agents/agydex.md
 /.codex/hooks.json

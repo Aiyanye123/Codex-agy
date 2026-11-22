@@ -1,10 +1,15 @@
-# Codex-agy
+# antigravity-codex-bridge
 
 <p align="center">
   <a href="README.md">English</a> · <strong>简体中文</strong>
 </p>
 
-Codex-agy 是一个 Windows 本地桥接工具。你在 Antigravity CLI 里提需求，Gemini 整理任务和验收条件，Codex App 在你的项目里执行。Gemini 收到 Codex 的回执后，可以核对实际产出，发现漏项时继续跟进，最后在原来的 Antigravity 对话里向你汇报。
+antigravity-codex-bridge 在 Windows 本机连接 Antigravity CLI 和 Codex App，由 Gemini 协调并验收，Codex 在你的项目里执行任务。
+
+- Gemini 整理需求、派单、后台等回执，并按验收条件追补遗漏。默认只收摘要，节省对话上下文，需要时再取全文。
+- 可以新建或绑定已有的 Codex 会话。每条 Antigravity 对话独立保存绑定，也能回看绑定会话的近期回复。
+- 可选用 `rg` 在 Antigravity 当前工作区内做只读检索，跳过常见敏感文件。代码审阅和长材料交给 Codex。
+- 桥接在本机运行，无需常驻服务。绑定和工单记录保存在本地 SQLite，已完结工单的回执原文保留 30 天后自动清理。
 
 ## 安装
 
@@ -32,8 +37,8 @@ codex.exe queue --help
 在 GitHub 点 **Code → Download ZIP**，解压到一个会长期保留的目录，再用 PowerShell 7 打开解压后的目录。如果已安装 Git，也可以从你想存放桥接程序的父目录运行下列命令。
 
 ```powershell
-git clone https://github.com/Aiyanye123/Codex-agy.git
-Set-Location .\Codex-agy
+git clone https://github.com/Aiyanye123/antigravity-codex-bridge.git
+Set-Location .\antigravity-codex-bridge
 ```
 
 在能看到 `Install.ps1` 的目录执行一次全局安装。仓库已经包含运行文件，安装时直接使用即可。
@@ -42,21 +47,23 @@ Set-Location .\Codex-agy
 .\Install.ps1 -Global
 ```
 
-全局安装只对当前 Windows 用户生效。之后可以在任意工作目录启动 `codex-agy`，无需在每个项目重新安装。请保留桥接程序的安装目录，Antigravity 配置会引用其中的文件。
+全局安装只对当前 Windows 用户生效。之后可以在任意工作目录运行 `agy --agent agydex`，无需在每个项目重新安装。请保留桥接程序的安装目录，Antigravity 配置会引用其中的文件。
 
 升级时，在原目录更新桥接文件，重新执行原来的安装命令，然后重启 Antigravity。如果还做过工作区安装，也在对应工作区重新执行安装命令。安装器会更新托管的角色和 MCP 设置，保留其他 MCP 服务。遇到手动修改的角色或同名服务冲突，会停下并提示需要核对的文件。
+
+从 `codex-agy` 升级时，安装器会新增 `agydex` 并保留旧角色。沿用原安装目录和设置即可继续使用现有数据库。
 
 ### 让 Agent 帮你安装
 
 把下面整段发给能操作 Windows 终端的 Agent，例如 Codex App。
 
 ```text
-请在这台 Windows 电脑上为当前用户安装 Codex-agy。
-项目地址是 https://github.com/Aiyanye123/Codex-agy 。请先读仓库 README，再按安装说明操作。
+请在这台 Windows 电脑上为当前用户安装 antigravity-codex-bridge。
+请先阅读并遵循仓库的 README，地址为 https://github.com/Aiyanye123/antigravity-codex-bridge
 如果已经在项目目录，优先使用现有副本。否则用 Git 克隆或下载 ZIP，放在当前用户可写、以后会保留的目录。保留现有配置和会话数据库。
 检查 PowerShell 7、Node.js 22.13+、Antigravity CLI、Codex App 和可执行 codex.exe。用 codex.exe queue --help 确认支持队列功能。缺失的依赖按 README 链接的官方 Windows 指南安装。需要我完成登录或系统弹窗时，告诉我具体要做什么。
 在项目目录用 PowerShell 7 执行 .\Install.ps1 -Global。若安装器发现已有冲突，保留原配置并告诉我冲突的位置。
-用 agy agents 和 agy mcp list 确认能找到 codex-agy 和 codex_bridge。最后告诉我安装位置和验证结果，以及如何在我的工作目录运行 agy --agent codex-agy。验证安装时无需派发真实工单。
+用 agy agents 和 agy mcp list 确认能找到 agydex 和 codex_bridge。最后告诉我安装位置和验证结果，以及如何在我的工作目录运行 agy --agent agydex。验证安装时无需派发真实工单。
 ```
 
 ## 快速开始
@@ -67,7 +74,7 @@ Set-Location .\Codex-agy
 
 ```powershell
 Set-Location 'C:\Work\MyProject'
-agy --agent codex-agy
+agy --agent agydex
 ```
 
 在 Antigravity 里发一个任务，例如「让 Codex 看一下这个目录，简单说明主要文件的用途，先保持文件原样。」
@@ -99,7 +106,7 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | 换成另一个已有会话 | 发送新的 Codex 会话链接并要求绑定。 |
 | 解除当前绑定 | 说「取消绑定」或「解绑」。已派发的工单仍可查询。 |
 | 改用一个新会话 | 说「新开一个 Codex 会话处理」，到 App 发送预填的首条任务。 |
-| 退出后恢复绑定 | 用 `/resume` 选回原来的 Antigravity 对话。也可以在同一目录运行 `agy --agent codex-agy -c` 恢复最近的对话，或用 `--conversation` 加对话 ID 精确恢复。 |
+| 退出后恢复绑定 | 用 `/resume` 选回原来的 Antigravity 对话。也可以在同一目录运行 `agy --agent agydex -c` 恢复最近的对话，或用 `--conversation` 加对话 ID 精确恢复。 |
 
 绑定按 Antigravity 对话保存。同一目录可以有多条对话，各自绑定不同的 Codex 会话。
 
@@ -115,7 +122,7 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 
 | 遇到的情况 | 可以怎么处理 |
 | --- | --- |
-| `Agent Not Found` | 在工作目录运行 `agy agents` 和 `agy mcp list`，检查是否有 `codex-agy` 和 `codex_bridge`。如果还没全局安装，回到桥接安装目录运行 `.\Install.ps1 -Global`，再打开一个新的 Antigravity 进程。 |
+| `Agent Not Found` | 在工作目录运行 `agy agents` 和 `agy mcp list`，检查是否有 `agydex` 和 `codex_bridge`。如果还没全局安装，回到桥接安装目录运行 `.\Install.ps1 -Global`，再打开一个新的 Antigravity 进程。 |
 | 执行策略阻止 ZIP 中的脚本 | 确认 ZIP 来自本仓库并审阅 `Install.ps1` 后，在桥接目录运行 `Unblock-File -LiteralPath .\Install.ps1`，再执行安装。 |
 | `Get-Command codex.exe` 找不到命令，或 `queue` 不可用 | 按上面的官方指南安装或更新 Windows 版 Codex CLI，再打开新终端确认。 |
 | Codex 做完了，Antigravity 还没汇报 | 在原对话说「查结果」。如果刚创建的会话仍在等待发送，到 Codex App 发送预填任务。如果仍显示运行中，查看 Codex App 是否在等审批。 |
@@ -123,4 +130,4 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 
 ## 开源协议
 
-Codex-agy 使用 [MIT 开源协议](LICENSE)。第三方依赖的许可声明见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。
+antigravity-codex-bridge 使用 [MIT 开源协议](LICENSE)。第三方依赖的许可声明见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。

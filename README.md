@@ -1,10 +1,15 @@
-# Codex-agy
+# antigravity-codex-bridge
 
 <p align="center">
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-Codex-agy connects Antigravity CLI to Codex App on Windows. Describe what you need in Antigravity. Gemini turns your request into a task with clear acceptance criteria, and Codex works in your project. Gemini can check what Codex delivered, follow up on missing work, and report back in the original Antigravity conversation. The bundled agent is configured to report in Simplified Chinese.
+antigravity-codex-bridge connects Antigravity CLI and Codex App on your Windows PC so Gemini can coordinate and review work that Codex performs in your project.
+
+- Gemini prepares and dispatches tasks, waits in the background, checks results, and follows up on gaps. It receives a short receipt by default to save context and can fetch the full reply on request.
+- Open a new Codex chat or bind an existing one. Each Antigravity conversation keeps its own binding and can look back at recent replies in the bound chat.
+- Optional read-only `rg` search stays within the current Antigravity workspace and skips common sensitive files. Codex handles code review and long materials.
+- The bridge runs locally without a persistent background service. It keeps bindings and task records in SQLite and clears stored reply text from finished tasks after 30 days.
 
 ## Installation
 
@@ -32,8 +37,8 @@ codex.exe queue --help
 On GitHub, choose **Code → Download ZIP** and extract it to a folder you can keep. Open that folder in PowerShell 7. If you have Git, you can also run these commands from the folder where you want to keep the bridge.
 
 ```powershell
-git clone https://github.com/Aiyanye123/Codex-agy.git
-Set-Location .\Codex-agy
+git clone https://github.com/Aiyanye123/antigravity-codex-bridge.git
+Set-Location .\antigravity-codex-bridge
 ```
 
 Run the installer once from the folder containing `Install.ps1`. The repository includes the files the bridge needs at runtime.
@@ -42,21 +47,23 @@ Run the installer once from the folder containing `Install.ps1`. The repository 
 .\Install.ps1 -Global
 ```
 
-Global installation applies to the current Windows user. You can then start `codex-agy` from any working folder. Keep the bridge's installation folder in place because Antigravity references files there.
+Global installation applies to the current Windows user. You can then start `agy --agent agydex` from any working folder. Keep the bridge's installation folder in place because Antigravity references files there.
 
 To upgrade, update the bridge files in the same folder and rerun the original install command, then restart Antigravity. If you also installed the bridge in a workspace, rerun its workspace install command too. The installer refreshes its own agent and MCP settings and keeps other MCP servers. If it detects an edited agent or a conflicting server, it stops and shows the file to review.
+
+When upgrading from `codex-agy`, the installer adds `agydex` alongside the old agent and keeps using the existing database when you install in place with the same settings.
 
 ### Ask an agent to install it
 
 Copy this prompt into an agent that can use your Windows terminal, such as Codex App.
 
 ```text
-Install Codex-agy for my current user on this Windows computer.
-The repository is https://github.com/Aiyanye123/Codex-agy . Read its README and follow the installation instructions.
+Install antigravity-codex-bridge for my current user on this Windows computer.
+Read and follow the README at https://github.com/Aiyanye123/antigravity-codex-bridge
 If you are already in a local copy of the project, use it. Otherwise, clone it with Git or download the ZIP into a permanent folder my user can write to. Preserve any existing configuration and session database.
 Check for PowerShell 7, Node.js 22.13+, Antigravity CLI, Codex App, and an executable codex.exe. Run codex.exe queue --help to check queue support. Use the official Windows guides linked in the README to install missing prerequisites. If I need to sign in or respond to a system prompt, tell me exactly what to do.
 Run .\Install.ps1 -Global in PowerShell 7 from the project folder. If the installer detects a configuration conflict, preserve the existing configuration and tell me where it is.
-Use agy agents and agy mcp list to verify that codex-agy and codex_bridge are available. Tell me where the bridge is installed, what you verified, and how to run agy --agent codex-agy from my work folder. Verify the installation without dispatching a real task.
+Use agy agents and agy mcp list to verify that agydex and codex_bridge are available. Tell me where the bridge is installed, what you verified, and how to run agy --agent agydex from my work folder. Verify the installation without dispatching a real task.
 ```
 
 ## Quick start
@@ -67,7 +74,7 @@ In PowerShell 7, go to the folder where you want Codex to work and start Antigra
 
 ```powershell
 Set-Location 'C:\Work\MyProject'
-agy --agent codex-agy
+agy --agent agydex
 ```
 
 Give Antigravity a task, such as “Ask Codex to inspect this folder and briefly explain the main files. Leave the files as they are.”
@@ -99,7 +106,7 @@ After Gemini confirms the binding and working folder, give Antigravity a task. S
 | Switch to another existing chat | Send the new Codex chat link and ask to bind it. |
 | Remove the current binding | Say “Unbind.” Previously dispatched tasks remain available to check. |
 | Switch to a new chat | Say “Start a new Codex chat for this task,” then send the prepared first message in the app. |
-| Resume after exiting | Use `/resume` to select the original Antigravity conversation. In the same folder, `agy --agent codex-agy -c` resumes the most recent conversation. To pick a specific one by ID, use `--conversation` followed by the ID. |
+| Resume after exiting | Use `/resume` to select the original Antigravity conversation. In the same folder, `agy --agent agydex -c` resumes the most recent conversation. To pick a specific one by ID, use `--conversation` followed by the ID. |
 
 Bindings are saved per Antigravity conversation. Conversations started from the same folder can target different Codex chats.
 
@@ -107,7 +114,7 @@ With `rg.exe` on PATH, Gemini can search files, documents, code and configuratio
 
 ## Completion, files, and local data
 
-- **Waiting and reporting.** While the Antigravity conversation is open, Gemini can wait for a reply in the background for up to an hour at a time. Gemini checks the Codex reply against your request, follows up on gaps, and summarizes the outcome. It can consult a document or a named result file when needed. It can follow up on routine work you already authorized. It will ask about scope changes, material decisions, or approvals in Codex App. If you exit Antigravity, resume the original conversation and say “Check the result.”
+- **Waiting and reporting.** While the Antigravity conversation is open, Gemini can wait for a reply in the background for up to an hour at a time. Gemini checks the Codex reply against your request, follows up on gaps, and summarizes the outcome in Simplified Chinese. It can consult a document or a named result file when needed. It can follow up on routine work you already authorized. It will ask about scope changes, material decisions, or approvals in Codex App. If you exit Antigravity, resume the original conversation and say “Check the result.”
 - **Images and files.** Save the material in a local folder Codex can access and include the full path in your request, such as `C:\Work\MyProject\reference.png`. The bridge carries text tasks and replies. Files stay on your computer, and Codex can read them by path. To attach an image directly to a chat, add it in Codex App.
 - **Configuration and records.** Global configuration lives under `%USERPROFILE%\.gemini\config\`. Bindings, task state, and text replies are stored in `.state\bridge.sqlite` under the installation folder by default. On startup, the bridge clears local reply text from finished tasks last updated over 30 days ago. Task records and bindings are kept. The bridge starts with Antigravity and requires no separate startup service. Antigravity and Codex still use their respective model services to process tasks.
 
@@ -115,7 +122,7 @@ With `rg.exe` on PATH, Gemini can search files, documents, code and configuratio
 
 | Symptom | What to do |
 | --- | --- |
-| `Agent Not Found` | From your working folder, run `agy agents` and `agy mcp list` and look for `codex-agy` and `codex_bridge`. If you have yet to install globally, run `.\Install.ps1 -Global` from the bridge folder and start a fresh Antigravity process. |
+| `Agent Not Found` | From your working folder, run `agy agents` and `agy mcp list` and look for `agydex` and `codex_bridge`. If you have yet to install globally, run `.\Install.ps1 -Global` from the bridge folder and start a fresh Antigravity process. |
 | PowerShell blocks the script from a ZIP | Confirm the ZIP came from this repository and review `Install.ps1`. In the bridge folder, run `Unblock-File -LiteralPath .\Install.ps1`, then run the installer. |
 | `Get-Command codex.exe` finds nothing, or `queue` is unavailable | Install or update the Windows Codex CLI using the official guide above, then check again in a new terminal. |
 | Codex finished but Antigravity is quiet | Say “Check the result” in the original conversation. If a new chat is waiting for the draft to be sent, send it in Codex App. If the task still appears to be running, check the app for a pending approval. |
@@ -123,4 +130,4 @@ With `rg.exe` on PATH, Gemini can search files, documents, code and configuratio
 
 ## License
 
-Codex-agy is released under the [MIT License](LICENSE). See [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for third-party notices.
+antigravity-codex-bridge is released under the [MIT License](LICENSE). See [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) for third-party notices.

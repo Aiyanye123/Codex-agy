@@ -73,16 +73,18 @@ function install(workspace, { global = false, hooksOnly = false, expectedError }
   } else {
     assert.equal(result.status, 0, result.stderr);
   }
+  return result.stdout;
 }
 
 function files(configRoot) {
-  return { agent: path.join(configRoot, "agents/codex-agy/agent.md"), mcp: path.join(configRoot, "mcp_config.json") };
+  return { agent: path.join(configRoot, "agents/agydex/agent.md"), mcp: path.join(configRoot, "mcp_config.json") };
 }
 
 test("fresh global install in a disposable profile; repeating it does not rewrite settings", async () => {
   const { agent, mcp } = files(path.join(env.USERPROFILE, ".gemini/config"));
-  install("", { global: true });
+  assert.match(install("", { global: true }), /agy --agent agydex\b/);
   assert.equal(readFileSync(agent, "utf8"), readFileSync(sourceAgent, "utf8"));
+  assert.match(readFileSync(agent, "utf8"), /^name: agydex$/m);
   const server = readJson(mcp).mcpServers.codex_bridge;
   assert.equal(server.args[2], ".");
   assert.equal(server.timeoutSeconds, 3700);
@@ -110,20 +112,28 @@ test("fresh global install in a disposable profile; repeating it does not rewrit
   assert.deepEqual(paths.map(file => statSync(file).mtimeMs), times);
 });
 
-test("published workspace upgrades its agent and full MCP settings and preserves other servers", () => {
+test("legacy workspace installs agydex, preserves old roles, and upgrades only the bridge MCP settings", () => {
   const workspace = path.join(scratch, "legacy");
-  const { agent, mcp } = files(path.join(workspace, ".agents"));
-  mkdirSync(path.dirname(agent), { recursive: true });
-  const oldAgent = execFileSync("git", ["show", "bbbe1b1:src/agent.md"], { cwd: repo, encoding: "utf8" });
-  writeFileSync(agent, oldAgent.replace(/\r?\n/g, "\r\n"));
+  const configRoot = path.join(workspace, ".agents");
+  const { agent, mcp } = files(configRoot);
+  const legacyAgent = path.join(configRoot, "agents/codex-agy/agent.md");
+  const legacyFlat = path.join(configRoot, "agents/codex-agy.md");
+  mkdirSync(path.dirname(legacyAgent), { recursive: true });
+  const oldAgent = execFileSync("git", ["show", "bbbe1b1:src/agent.md"], { cwd: repo, encoding: "utf8" })
+    .replace(/\r?\n/g, "\r\n");
+  const customLegacy = oldAgent + "\r\nCustom legacy instructions\r\n";
+  writeFileSync(legacyAgent, oldAgent);
+  writeFileSync(legacyFlat, customLegacy);
   const thirdParty = { command: "other.exe", args: ["--example"], env: { TEST: "untouched" } };
   writeJson(mcp, { mcpServers: { other: thirdParty, codex_bridge: {
     command: "C:\\old\\node.exe", args: ["--disable-warning=ExperimentalWarning", path.join(scratch, "mcp.cjs"),
       workspace, "old-state", "old-codex"], timeoutSeconds: 45, disabled: true,
     tools: { obsolete: {}, watch: { eager: false } },
   } } });
-  install(workspace);
+  assert.match(install(workspace), /Existing codex-agy agent files were preserved/);
   assert.equal(readFileSync(agent, "utf8"), readFileSync(sourceAgent, "utf8"));
+  assert.equal(readFileSync(legacyAgent, "utf8"), oldAgent);
+  assert.equal(readFileSync(legacyFlat, "utf8"), customLegacy);
   const servers = readJson(mcp).mcpServers;
   assert.deepEqual(servers.other, thirdParty);
   assert.equal(servers.codex_bridge.disabled, true);
@@ -166,15 +176,19 @@ test("hooks-only creates only hooks and repeating it leaves the file untouched",
   assert.equal(statSync(hooks).mtimeMs, time);
 });
 
-test("installed fingerprint permits a later template upgrade without a hard-coded legacy hash", () => {
+test("an existing flat agydex agent is tracked and upgraded in place", () => {
   const workspace = path.join(scratch, "later-release");
+  const configRoot = path.join(workspace, ".agents");
+  const flatAgent = path.join(configRoot, "agents/agydex.md");
   const original = readFileSync(sourceAgent, "utf8");
   try {
-    writeFileSync(sourceAgent, original + "\nFirst synthetic release\n");
+    mkdirSync(path.dirname(flatAgent), { recursive: true });
+    writeFileSync(flatAgent, original);
     install(workspace);
     writeFileSync(sourceAgent, original + "\nNext synthetic release\n");
     install(workspace);
-    assert.equal(readFileSync(files(path.join(workspace, ".agents")).agent, "utf8"), readFileSync(sourceAgent, "utf8"));
+    assert.equal(readFileSync(flatAgent, "utf8"), readFileSync(sourceAgent, "utf8"));
+    assert.equal(existsSync(files(configRoot).agent), false);
   } finally {
     writeFileSync(sourceAgent, original);
   }

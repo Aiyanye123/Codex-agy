@@ -126,26 +126,21 @@ if (!$HooksOnly) {
     }
     if (!(Test-Path -LiteralPath $server -PathType Leaf)) { throw "Bridge file missing: $server" }
     $agentText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'src/agent.md'))
-    $agentPath = Join-Path $configRoot 'agents/codex-agy/agent.md'
-    $flatPath = Join-Path $configRoot 'agents/codex-agy.md'
+    $agentPath = Join-Path $configRoot 'agents/agydex/agent.md'
+    $flatPath = Join-Path $configRoot 'agents/agydex.md'
     if (Test-Path -LiteralPath $flatPath -PathType Leaf) { $agentPath = $flatPath }
+    $legacyAgentExists = (Test-Path -LiteralPath (Join-Path $configRoot 'agents/codex-agy/agent.md')) -or
+        (Test-Path -LiteralPath (Join-Path $configRoot 'agents/codex-agy.md'))
 
     $templateHash = Get-TextFingerprint $agentText
     $targetKey = Get-TextFingerprint ([IO.Path]::GetFullPath($agentPath).ToUpperInvariant())
     $receipt = Join-Path $stateRoot "managed-agents/$targetKey.sha512"
     $lastInstalled = if (Test-Path -LiteralPath $receipt) { [IO.File]::ReadAllText($receipt).Trim() }
-    $known = @(
-        # Published bbbe1b1, P0 follow-up validation, and the subsequent reporting revision.
-        'da197627bc8a202ad7198f8d4d29581c60ee943285cc4ae27b959d4ac00befdbfd440cb7c1dd63d7cdaf73c7b70756691e311fd773ff6d484d495d3f5fed077e'
-        'cb0220faafd101436bab58dfcb1bf98639c2d9a8f50bb074f3e3afbe573204ad69741d4f573d31fea7c3c9016df32ea0545c990773438df6f013cb332a680be0'
-        '5ea586f79c9be4507d845814b8c38413e76d443f35c943ddc30640c196dae7a39d8dc515fc2ae7971dd29c1b47349e601790d0eae6ca511c4b71fb4636216f19'
-        $lastInstalled
-    )
     $writeAgent = $true
     if (Test-Path -LiteralPath $agentPath) {
         $installed = Get-TextFingerprint ([IO.File]::ReadAllText($agentPath))
         $writeAgent = $installed -ne $templateHash
-        if ($writeAgent -and $installed -notin $known) {
+        if ($writeAgent -and $installed -ne $lastInstalled) {
             throw "Custom coordinator preserved at $agentPath. Back it up and merge it with src/agent.md before retrying."
         }
     }
@@ -199,6 +194,7 @@ if (!$HooksOnly) {
     if ($writeMcp) { [IO.File]::WriteAllText($mcpPath, ($mcp | ConvertTo-Json -Depth 100) + "`n") }
     if ($writeAgent) { [IO.File]::WriteAllText($agentPath, $agentText) }
     if ($lastInstalled -ne $templateHash) { [IO.File]::WriteAllText($receipt, $templateHash) }
+    if ($legacyAgentExists) { Write-Output 'Existing codex-agy agent files were preserved. Use agydex for the new coordinator.' }
 }
 
 if ($writeHooks) {
@@ -212,9 +208,9 @@ if ($HooksOnly) {
     }
 } elseif ($Global) {
     Write-Output 'Configured Antigravity for this Windows user.'
-    Write-Output 'Start Antigravity from the folder you want Codex to work in: agy --agent codex-agy'
+    Write-Output 'Start Antigravity from the folder you want Codex to work in: agy --agent agydex'
 } else {
     Write-Output "Configured workspace: $project"
-    Write-Output 'Start Antigravity in this workspace: agy --agent codex-agy'
+    Write-Output 'Start Antigravity in this workspace: agy --agent agydex'
     Write-Output 'Optional: review AGY Codex Bridge in Codex App Settings > Hooks for immediate task receipts.'
 }
