@@ -80,7 +80,7 @@ agy --agent agydex
 
 Give Antigravity a task, such as “Ask Codex to inspect this folder and briefly explain the main files. Leave the files as they are.”
 
-The bridge starts a new Codex chat in direct mode and sends the first task immediately. Keep Antigravity open for approval requests and the final receipt. To review the first message or pick a model in the app, ask for a desktop draft. Review the text, keep the task marker, then click **Send**.
+By default, the bridge opens a new chat with a prefilled draft in Codex App. Review the text, keep the task marker, then click **Send**.
 
 ### Bind an existing Codex chat
 
@@ -90,13 +90,15 @@ Open the target chat in Codex App. Press `Ctrl` + `Alt` + `L` to copy its link a
 Bind this Codex chat codex://threads/00000000-0000-4000-8000-000000000001
 ```
 
-After Gemini confirms the binding and working folder, give Antigravity a task. Subsequent tasks go to that Codex chat's queue and use its working folder and model settings. If a task stays queued, open the target chat in Codex App.
+After Gemini confirms the binding and working folder, give Antigravity a task. In desktop mode, tasks go to that Codex chat's queue and use its working folder and model settings. If a task stays queued, open the target chat in Codex App.
 
 ### Direct execution and approvals
 
-Direct turns use Codex's local settings unless you explicitly request a different `sandbox` or `approval_policy`. An explicit read-only or workspace-write sandbox uses MXC for the child process on Windows. You can ask Gemini to steer or interrupt an active direct turn. When Codex asks for approval or an answer, Gemini shows the specific request, sends your decision through `approve`, and resumes waiting.
+To switch to direct execution, ask Antigravity to use direct mode (`submit` with `execution_mode: "direct"`). It starts the task immediately in a new or existing chat. Later tasks on the same binding keep using direct mode. To switch back, ask Antigravity to use desktop mode (`execution_mode: "desktop"`).
 
-The bridge releases the write connection when a direct turn finishes. If Codex App already holds the write connection when the next task arrives, the bridge queues the task once and reports the switch to desktop mode. The desktop chat's sandbox and approval settings apply to that task.
+Direct turns use Codex's local settings unless you explicitly request a different `sandbox` or `approval_policy`. Desktop submissions reject those overrides and use the desktop chat's settings. An explicit read-only or workspace-write sandbox uses MXC for the child process on Windows. Keep Antigravity open for approval requests and the final receipt. You can ask Gemini to steer or interrupt an active direct turn. When Codex asks for approval or an answer, Gemini shows the specific request, sends your decision through `approve`, and resumes waiting.
+
+The bridge releases the write connection when a direct turn finishes. Opening the chat in Codex App can take that connection. If the app holds it when the next direct task arrives, the bridge queues the task once and switches the binding to desktop mode. The desktop chat's sandbox and approval settings apply to that task.
 
 ### Run tasks in parallel
 
@@ -118,7 +120,7 @@ Project hooks are optional. To record worktree activity through hooks, run the h
 | Abandon a draft or stop tracking | Give the task ID and say “Abandon this draft” or “Stop tracking.” Close any abandoned draft in the app. A task already sent to Codex can keep running. |
 | Switch to another existing chat | Send the new Codex chat link and ask to bind it. |
 | Remove the current binding | Say “Unbind.” Previously dispatched tasks remain available to check. |
-| Switch to a new chat | Say “Start a new Codex chat for this task.” Ask for a desktop draft if you want to review it before sending. |
+| Switch to a new chat | Say “Start a new Codex chat for this task.” This opens a draft in Codex App. Ask for direct mode to send immediately. |
 | Resume after exiting | Use `/resume` to select the original Antigravity conversation. In the same folder, `agy --agent agydex -c` resumes the most recent conversation. To pick a specific one by ID, use `--conversation` followed by the ID. |
 
 With `rg.exe` on PATH, Gemini can search files, documents, code and configuration, or all text in the current Antigravity workspace. Try “Find references to `queueTask` under `src/` in `*.mjs` files.” Search supports a relative path, glob, case and whole-word matching, optional regular expressions, and up to two lines of context. Git-ignored files, symbolic links, common credentials, and lockfiles are skipped. Hidden project configuration such as `.github/` is searchable. A bound Codex chat in a different folder retains its own working directory. Ask Codex to inspect that folder or review lengthy material.
@@ -136,6 +138,7 @@ With `rg.exe` on PATH, Gemini can search files, documents, code and configuratio
 | `Agent Not Found` | From your working folder, run `agy agents` and `agy mcp list` and look for `agydex` and `codex_bridge`. If you have yet to install globally, run `.\Install.ps1 -Global` from the bridge folder and start a fresh Antigravity process. |
 | PowerShell blocks the script from a ZIP | Confirm the ZIP came from this repository and review `Install.ps1`. In the bridge folder, run `Unblock-File -LiteralPath .\Install.ps1`, then run the installer. |
 | `Get-Command codex.exe` finds nothing, or `queue` is unavailable | Install or update the Windows Codex CLI using the official guide above, then check again in a new terminal. |
+| `thread/read: thread not loaded` | Open the bound chat in Codex App and retry. If the chat is unavailable, bind a working chat or start a new one. |
 | Codex finished but Antigravity is quiet | Say “Check the result” in the original conversation. For a desktop draft, send it in Codex App. Approvals for direct turns appear in Antigravity. Approvals for desktop turns appear in Codex App. |
 | You're wondering whether to enable Codex hooks | Antigravity's background wait handles normal completion reports. You can disable existing `AGY Codex Bridge` hooks in Codex App. Project hooks can record acceptance and completion earlier, and the current version uses them to record manual interruptions. After a global install, run `.\Install.ps1 -Workspace 'C:\Work\MyProject' -HooksOnly` from the bridge folder, substituting your project path. This installs only the project hooks. Review and enable them in Codex App. If you set a custom `-StateDirectory`, use it here too. |
 

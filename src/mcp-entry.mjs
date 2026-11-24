@@ -151,6 +151,22 @@ async function readThread(threadId) {
   return { directory: workspacePath(thread.cwd), name: thread.name ?? null };
 }
 
+async function readDispatchWorkspace(threadId, savedWorkspace, mode) {
+  try {
+    return (await readThread(threadId)).directory;
+  } catch (error) {
+    if (error.code !== -32600 || !error.message.startsWith(`thread not loaded: ${threadId}`)) throw error;
+    // The history reader has its own app-server. Let the direct writer attempt to resume the same thread.
+    if (mode === "direct" && savedWorkspace) return workspacePath(savedWorkspace);
+    throw new Error(`未派单。Codex 无法读取绑定会话 ${threadId}（thread/read: thread not loaded）。请在 Codex App 打开该会话后重试。如果会话已不可用，请重新绑定或新开会话。`, { cause: error });
+  }
+}
+
+function setBindingMode(owner, sessionName, threadId, mode) {
+  database.prepare("UPDATE bindings SET execution_mode = ? WHERE owner = ? AND session_name = ? AND thread_id = ?")
+    .run(mode, owner, sessionName, threadId);
+}
+
 function draftUri(directory, message) {
   return `codex://threads/new?${new URLSearchParams({ path: directory, prompt: message })}`;
 }
@@ -185,6 +201,8 @@ function createTask(id, owner, sessionName, prompt, target, explicitNewChat, pen
       uri ? message : null, target.mode, target.mode === "direct" ? process.pid : null);
     if (newChat) {
       saveBinding(database, owner, sessionName, null, id, target.directory, target.worktree, target.mode);
+    } else if (target.requestedMode === "desktop") {
+      setBindingMode(owner, sessionName, target.threadId, "desktop");
     }
     return { id, message, uri, previousBinding: binding };
   });
@@ -266,8 +284,7 @@ async function launchDirect(owner, sessionName, task, target, sandbox, approvalP
     transaction(database, () => {
       markAccepted(database, task.id, run.threadId, turnId, process.pid);
       database.prepare("UPDATE tasks SET dispatch_deadline = NULL WHERE id = ?").run(task.id);
-      database.prepare("UPDATE bindings SET execution_mode = 'direct' WHERE owner = ? AND session_name = ? AND thread_id = ?")
-        .run(owner, sessionName, run.threadId);
+      setBindingMode(owner, sessionName, run.threadId, "direct");
     });
     storeApprovals(task.id, run.approvals);
     run.finished = finishDirect(task.id, run);
@@ -279,18 +296,18 @@ async function launchDirect(owner, sessionName, task, target, sandbox, approvalP
     if (target.threadId && desktopOwnsThread(error)) {
       transaction(database, () => {
         database.prepare("UPDATE tasks SET execution_mode = 'desktop', desktop_fallback = 1 WHERE id = ?").run(task.id);
-        database.prepare("UPDATE bindings SET execution_mode = 'desktop' WHERE owner = ? AND session_name = ? AND thread_id = ?")
-          .run(owner, sessionName, target.threadId);
+        setBindingMode(owner, sessionName, target.threadId, "desktop");
       });
       return "fallback";
     }
-    const detail = `直连派单未确认：${error.message}`;
+    const source = error.method ? `（${error.method}）` : "";
     if (run?.turnRequested) {
+      const detail = `直连派单未确认${source}：${error.message}`;
       database.prepare(`
         UPDATE tasks SET state = 'dispatch_unknown', detail = ?, writer_pid = NULL, dispatch_deadline = NULL WHERE id = ?
       `).run(`${detail} 请查询原工单，避免重复派单。`, task.id);
     } else {
-      failBeforeDispatch(owner, sessionName, task, detail);
+      failBeforeDispatch(owner, sessionName, task, `直连未派单${source}：${error.message}`);
     }
     taskChanges.emit(task.id);
     return "failed";
@@ -384,7 +401,7 @@ server.registerTool("unbind", {
 });
 
 server.registerTool("submit", {
-  description: "向目标子会话发送工单。新会话默认直连执行，通过 bind 绑定的会话默认桌面排队。新会话可用 worktree 隔离。",
+  description: "向目标子会话发送工单。新会话默认打开 Codex App 草稿，已绑定的桌面会话走排队。显式指定 execution_mode=direct 可切换到直连，同一绑定后续会沿用该模式，直到显式切回 desktop 或桌面占锁触发自动降级。新会话可用 worktree 隔离。",
   inputSchema: {
     prompt: z.string().trim().min(1).max(12000),
     new_chat: z.boolean().optional(),
@@ -404,14 +421,14 @@ server.registerTool("submit", {
   let threadId = newChat ? null : binding?.thread_id ?? null;
   if (followUpTaskId) threadId = validateFollowUp(database, owner, followUpTaskId, newChat, sessionName);
   if (threadId && isolated) throw new Error("只能为新会话创建工作树。请选择未绑定的子会话或明确另开会话。");
-  const mode = requestedMode ?? (threadId ? binding.execution_mode : "direct");
+  const mode = requestedMode ?? (threadId ? binding.execution_mode : "desktop");
   if (mode === "desktop" && (sandbox || approvalPolicy)) {
-    throw new Error("沙箱和审批参数用于直连模式。桌面模式沿用 Codex App 会话设置。");
+    throw new Error("桌面模式沿用 Codex App 会话设置。要传 sandbox 或 approval_policy，请指定 execution_mode: \"direct\"。");
   }
   const id = randomUUID();
   const worktree = isolated ? await planWorktree(workspace, id) : null;
-  const actualWorkspace = threadId ? (await readThread(threadId)).directory : worktree?.path ?? workspace;
-  const target = { directory: actualWorkspace, threadId, worktree, mode };
+  const actualWorkspace = threadId ? await readDispatchWorkspace(threadId, binding.workspace, mode) : worktree?.path ?? workspace;
+  const target = { directory: actualWorkspace, threadId, worktree, mode, requestedMode };
   const task = createTask(id, owner, sessionName, prompt, target, newChat, binding?.pending_task_id);
   if (task.pending) {
     return reportStatus(task.pending, null, {
@@ -475,7 +492,7 @@ server.registerTool("status", {
     return reply({
       state: "no_task",
       session_name: sessionName,
-      execution_mode: getBinding(database, owner, sessionName)?.execution_mode ?? "direct",
+      execution_mode: getBinding(database, owner, sessionName)?.execution_mode ?? "desktop",
       thread_id: binding.bound_thread_id,
       ...binding,
       bindings: await bindingOverview(owner),

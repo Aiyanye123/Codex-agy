@@ -292,13 +292,22 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
   const client = new Client({ name: "bridge-test", version: "1" });
   const transport = new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root });
   await client.connect(transport);
+  const invoke = (name, args) => client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": "owner" } });
   const call = async (name, args) => {
-    const response = await client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": "owner" } });
+    const response = await invoke(name, args);
     assert.ok(!response.isError, JSON.stringify(response.content));
     return response.structuredContent ?? JSON.parse(response.content[0].text);
   };
   try {
-    const draft = await call("submit", { prompt: "original", execution_mode: "desktop" });
+    assert.equal((await call("status", {})).execution_mode, "desktop");
+    for (const overrides of [{ sandbox: "read-only" }, { approval_policy: "never" }]) {
+      const rejected = await invoke("submit", { prompt: "desktop override", ...overrides });
+      assert.equal(rejected.isError, true);
+      assert.match(rejected.content[0].text, /execution_mode: "direct"/);
+    }
+    const draft = await call("submit", { prompt: "original" });
+    assert.equal(draft.execution_mode, "desktop");
+    assert.equal(draft.state, "awaiting_send");
     const args = { task_id: draft.task_id };
     const blocked = await call("submit", { prompt: "other" });
     assert.equal(blocked.new_task_dispatched, false);
@@ -311,11 +320,115 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
     const waiting = call("watch", args);
     assert.equal((await call("dismiss", args)).state, "cancelled");
     assert.equal((await waiting).state, "cancelled");
-    const next = await call("submit", { prompt: "next", execution_mode: "desktop" });
+    const next = await call("submit", { prompt: "next" });
     assert.notEqual(next.task_id, draft.task_id);
     assert.equal((await call("status", args)).bound_workspace, null);
-    const nearLimit = await call("submit", { prompt: "x".repeat(7800), new_chat: true, execution_mode: "desktop" });
+    const nearLimit = await call("submit", { prompt: "x".repeat(7800), new_chat: true });
+    assert.equal(nearLimit.execution_mode, "desktop");
     assert.equal(nearLimit.state, "awaiting_send");
+  } finally { await client.close(); }
+});
+
+test("MCP submit keeps direct bindings and handles unreadable or desktop-owned threads", async () => {
+  const statePath = path.join(scratch, "submit-modes.sqlite");
+  const threads = { active: randomUUID(), recoverable: randomUUID(), missing: randomUUID(), locked: randomUUID() };
+  const db = core.openDatabase(statePath);
+  for (const session of ["recoverable", "missing", "locked"]) {
+    core.saveBinding(db, "owner", session, threads[session], null, scratch, null, session === "locked" ? "direct" : "desktop");
+  }
+  db.close();
+  const codex = `
+    const threads = ${JSON.stringify(threads)};
+    const send = value => console.log(JSON.stringify(value));
+    require("node:readline").createInterface({ input: process.stdin }).on("line", line => {
+      const { id, method, params } = JSON.parse(line);
+      if (method === "initialized") return;
+      if (method === "initialize") return send({ id, result: {} });
+      if (method === "thread/start") return send({ id, result: { thread: { id: threads.active } } });
+      if (method === "thread/resume") {
+        const threadId = params.threadId;
+        if (threadId === threads.locked || threadId === threads.missing) {
+          const message = threadId === threads.locked ? "thread already has an active writer" : "no rollout found for thread id " + threadId;
+          return send({ id, error: { code: -32600, message } });
+        }
+        return send({ id, result: { thread: { id: threadId } } });
+      }
+      if (method !== "turn/start") throw new Error("unexpected RPC " + method);
+      const turn = { id: require("node:crypto").randomUUID(), status: "completed" };
+      send({ method: "turn/started", params: { threadId: params.threadId, turn } });
+      send({ id, result: { turn } });
+      send({ method: "turn/completed", params: { threadId: params.threadId, turn } });
+    });
+  `;
+  const program = `
+    const childProcess = require("node:child_process");
+    const { spawn } = childProcess;
+    childProcess.spawn = (exe, args, options) => {
+      if (exe !== "mock-codex" || args[0] !== "app-server") throw new Error("unexpected process");
+      return spawn(process.execPath, ["-e", ${JSON.stringify(codex)}], options);
+    };
+    const core = require("./core.cjs");
+    const threads = ${JSON.stringify(threads)};
+    const workspace = ${JSON.stringify(scratch)};
+    core.CodexReader = class { close() {} async read(method, { threadId }) {
+      if (method !== "thread/read") throw new Error("unexpected read");
+      if (threadId === threads.recoverable || threadId === threads.missing) {
+        throw Object.assign(new Error("thread not loaded: " + threadId), { code: -32600 });
+      }
+      return { thread: { id: threadId, cwd: workspace } };
+    } };
+    core.queueTask = async (_, cwd, id) => {
+      if (cwd !== workspace || (id !== threads.active && id !== threads.locked)) throw new Error("unexpected queue target");
+    };
+    core.startDesktop = async () => {};
+    process.argv = ["node", "mcp", workspace, ${JSON.stringify(statePath)}, "mock-codex"];
+    require("./mcp.cjs");
+  `;
+  const client = new Client({ name: "submit-modes-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root });
+  await client.connect(transport);
+  const invoke = (name, args) => client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": "owner" } });
+  const call = async (name, args) => {
+    const response = await invoke(name, args);
+    assert.ok(!response.isError, JSON.stringify(response.content));
+    return response.structuredContent ?? JSON.parse(response.content[0].text);
+  };
+  const submit = (session_name, options) => call("submit", { prompt: "task", session_name, ...options });
+  const direct = { execution_mode: "direct" };
+  async function verifyDirect(session_name, options) {
+    const task = await submit(session_name, options);
+    assert.equal(task.execution_mode, "direct");
+    assert.equal(task.thread_id, threads[session_name]);
+    assert.equal((await call("watch", { session_name, task_id: task.task_id })).state, "no_report");
+  }
+
+  try {
+    await verifyDirect("active", direct);
+    await verifyDirect("active");
+    const switched = await submit("active", { execution_mode: "desktop" });
+    assert.equal(switched.state, "queued");
+    assert.equal((await submit("active")).execution_mode, "desktop");
+
+    const rejected = await invoke("submit", { session_name: "recoverable", prompt: "desktop task" });
+    assert.equal(rejected.isError, true);
+    assert.match(rejected.content[0].text, /未派单.*thread\/read: thread not loaded.*打开该会话后重试/);
+    assert.deepEqual((await call("list_tasks", { session_name: "recoverable" })).tasks, []);
+    await verifyDirect("recoverable", direct);
+    const newChat = await submit("recoverable", { new_chat: true });
+    assert.equal(newChat.execution_mode, "desktop");
+    assert.equal(newChat.state, "awaiting_send");
+
+    const missing = await submit("missing", direct);
+    assert.equal(missing.state, "dispatch_failed");
+    assert.match(missing.detail, /thread\/resume.*no rollout found/);
+
+    const fallback = await submit("locked");
+    assert.equal(fallback.state, "queued");
+    assert.equal(fallback.execution_mode, "desktop");
+    assert.equal(fallback.desktop_fallback, true);
+    const afterFallback = await submit("locked");
+    assert.equal(afterFallback.state, "queued");
+    assert.equal(afterFallback.desktop_fallback, false);
   } finally { await client.close(); }
 });
 

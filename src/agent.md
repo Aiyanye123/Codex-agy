@@ -34,8 +34,9 @@ tools:
 
 ## 派单与验收
 
-- 用 `submit` 派单并记录工单 ID。新会话默认直连，直接用 `watch`。用户要先看草稿时用 `execution_mode: "desktop"`，仅在 `awaiting_send` 时提醒用户到 App 点发送。绑定已有桌面会话默认排队。若 `desktop_fallback` 为真，告诉用户桌面已接手、本单已改用排队和桌面会话权限，根据工单状态继续跟踪。
-- 直连默认沿用本机 Codex 配置。用户给出本单权限要求时传 `sandbox` 或 `approval_policy`。用户要求改变进行中的直连回合时，用原工单 ID 调用 `steer` 或 `interrupt`。中断以返回的终态确认，等待确认时继续查原工单。
+- 用 `submit` 派单并记录工单 ID。新会话默认在 Codex App 打开草稿，仅在 `awaiting_send` 时提醒用户到 App 点发送。已绑定的桌面会话默认排队。用户要求直连时显式传 `execution_mode: "direct"`，同一绑定后续沿用直连。用户要求切回时传 `execution_mode: "desktop"`。
+- 在 Codex App 点开直连会话可能使桌面端占锁，下一单会自动降级。若 `desktop_fallback` 为真，告诉用户桌面已接手、本单已改用排队和桌面会话权限，根据工单状态继续跟踪。
+- 直连默认沿用本机 Codex 配置。按用户要求只在直连工单中传 `sandbox` 或 `approval_policy`。桌面工单沿用 App 会话设置。用户要求改变进行中的直连回合时，用原工单 ID 调用 `steer` 或 `interrupt`。中断以返回的终态确认，等待确认时继续查原工单。
 - `watch` 返回 `waiting_approval` 或 `waiting_user_input` 时，向用户展示待处理请求的命令、文件改动、权限或问题，以及目录、原因和可选决定。取得明确决定后用原 `task_id`、`request_id` 调用 `approve`。用户输入用 `decision: "answer"` 和按问题 ID 填的 `answers`。收到确认后再挂一次 `watch`。每个进行中的工单保留一个等待，`already_watching` 时沿用已有等待。
 - 返回 `new_task_dispatched: false` 或 `dispatch_unknown` 时，先核对原工单并向用户说明状态。
 - `watch` 返回后先看摘要。用户查进度或等待时说“继续”，用 `status` 查同一单。查结果或错过通知时用 `report_mode: summary`，只有摘要缺少验收所需信息或用户明确要全文时才用 `report_mode: full`。后台等待超时或报错时先查状态，工单仍在进行可重新挂后台等待。

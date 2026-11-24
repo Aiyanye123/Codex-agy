@@ -80,7 +80,7 @@ agy --agent agydex
 
 在 Antigravity 里发一个任务，例如「让 Codex 看一下这个目录，简单说明主要文件的用途，先保持文件原样。」
 
-桥接默认直连新建 Codex 会话并发送首单。保持 Antigravity 对话打开，以便收到审批请求和最终回执。如果想先在 App 审查工单或选择模型，可以要求用桌面草稿。确认内容后保留工单标记，再点**发送**。
+桥接默认在 Codex App 新建会话并预填草稿。确认内容后保留工单标记，再点**发送**。
 
 ### 绑定已有 Codex 会话
 
@@ -90,13 +90,15 @@ agy --agent agydex
 绑定这个 Codex 会话 codex://threads/00000000-0000-4000-8000-000000000001
 ```
 
-Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。后续任务会进入该 Codex 会话的队列，使用其工作目录和模型设置。任务一直显示已入队时，打开对应的 Codex 会话查看。
+Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。桌面模式下，任务会进入该 Codex 会话的队列，使用其工作目录和模型设置。任务一直显示已入队时，打开对应的 Codex 会话查看。
 
 ### 直连执行与审批
 
-直连默认沿用本机 Codex 设置，可以按工单指定 `sandbox` 或 `approval_policy`。Windows 上显式指定只读或工作区可写时，该执行进程使用 MXC。你可以要求 Gemini 纠偏或中断进行中的直连回合。Codex 请求审批或输入时，Gemini 会展示具体请求，取得你的决定后用 `approve` 回传，再继续等待。
+要切到直连，可以让 Antigravity「用直连模式执行」。`submit` 会传入 `execution_mode: "direct"`，立即向新会话或已绑定会话派单。同一绑定后续沿用直连。要切回桌面，要求使用桌面模式，派单时传 `execution_mode: "desktop"`。
 
-直连回合结束后会释放写入连接。下一单到达时，如果 Codex App 已接手该会话，桥接会自动入队一次并告知你已切到桌面模式。本单沿用桌面会话的沙箱和审批设置。
+直连默认沿用本机 Codex 设置，可以按工单指定 `sandbox` 或 `approval_policy`。桌面派单会拒绝这两个覆盖参数，沿用 App 会话设置。Windows 上显式指定只读或工作区可写时，该执行进程使用 MXC。保持 Antigravity 对话打开，以便收到审批请求和最终回执。你可以要求 Gemini 纠偏或中断进行中的直连回合。Codex 请求审批或输入时，Gemini 会展示具体请求，取得你的决定后用 `approve` 回传，再继续等待。
+
+直连回合结束后会释放写入连接。在 Codex App 点开该会话时，桌面端可能占用写入锁。下一张直连工单遇到占锁时会自动入队一次，绑定也会切到桌面模式。本单沿用桌面会话的沙箱和审批设置。
 
 ### 并行安排任务
 
@@ -118,7 +120,7 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | 放弃草稿或停止跟踪 | 指定工单说「放弃草稿」或「停止跟踪」。请关闭 App 中已放弃的草稿；已发送的任务仍可能继续执行。 |
 | 换成另一个已有会话 | 发送新的 Codex 会话链接并要求绑定。 |
 | 解除当前绑定 | 说「取消绑定」或「解绑」。已派发的工单仍可查询。 |
-| 改用一个新会话 | 说「新开一个 Codex 会话处理」。需要先审查时，可以要求用桌面草稿。 |
+| 改用一个新会话 | 说「新开一个 Codex 会话处理」。Codex App 会先打开草稿，想立即派单时可要求使用直连。 |
 | 退出后恢复绑定 | 用 `/resume` 选回原来的 Antigravity 对话。也可以在同一目录运行 `agy --agent agydex -c` 恢复最近的对话，或用 `--conversation` 加对话 ID 精确恢复。 |
 
 如果 `rg.exe` 已加入 PATH，Gemini 可以只读查找文件、检索文档、代码与配置，或搜全部文本。例如「在 `src/` 的 `*.mjs` 文件里定位 `queueTask`」。检索支持相对路径、通配符、大小写、全词、正则和最多两行上下文。工具跳过 Git 忽略项、符号链接、常见凭据和锁文件，允许检索 `.github/` 等项目配置。绑定的 Codex 会话在另一个目录时，那个目录的核对及长材料审阅交给 Codex。
@@ -136,6 +138,7 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | `Agent Not Found` | 在工作目录运行 `agy agents` 和 `agy mcp list`，检查是否有 `agydex` 和 `codex_bridge`。如果还没全局安装，回到桥接安装目录运行 `.\Install.ps1 -Global`，再打开一个新的 Antigravity 进程。 |
 | 执行策略阻止 ZIP 中的脚本 | 确认 ZIP 来自本仓库并审阅 `Install.ps1` 后，在桥接目录运行 `Unblock-File -LiteralPath .\Install.ps1`，再执行安装。 |
 | `Get-Command codex.exe` 找不到命令，或 `queue` 不可用 | 按上面的官方指南安装或更新 Windows 版 Codex CLI，再打开新终端确认。 |
+| `thread/read: thread not loaded` | 在 Codex App 打开已绑定的会话后重试。若该会话已不可用，请绑定一个可用会话或新开会话。 |
 | Codex 做完了，Antigravity 还没汇报 | 在原对话说「查结果」。等待发送的桌面草稿需在 Codex App 发送。直连工单的审批出现在 Antigravity，桌面工单的审批出现在 Codex App。 |
 | 是否需要启用 Codex 钩子 | 日常完成汇报由 Antigravity 后台等待提供，已配置的 `AGY Codex Bridge` 钩子可以在 Codex App 中关闭。项目钩子可更早记录接单和完成。当前版本还通过钩子记录手动中断。全局安装后，可在桥接安装目录运行 `.\Install.ps1 -Workspace 'C:\Work\MyProject' -HooksOnly`，把路径换成你的项目，再到 Codex App 审查并启用。此模式只安装项目钩子。如果全局安装用了自定义 `-StateDirectory`，这里也要指定同一路径。 |
 

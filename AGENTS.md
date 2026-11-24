@@ -1,6 +1,6 @@
 # Agent guide
 
-This project connects Antigravity CLI to Codex on Windows. It runs new chats through a per-turn `codex app-server` process, uses `codex queue` for desktop bindings, and tracks tasks in SQLite. It runs without a persistent background service.
+This project connects Antigravity CLI to Codex on Windows. New chats open as drafts in Codex App for manual sending. The bridge uses `codex queue` for desktop bindings, a per-turn `codex app-server` process for direct execution, and SQLite to track tasks. It runs without a persistent background service.
 
 ## Repository map
 
@@ -25,6 +25,7 @@ This project connects Antigravity CLI to Codex on Windows. It runs new chats thr
 - Never read, write, or migrate the live `.state\bridge.sqlite` directly during development or verification. Use a separate Git worktree for schema and hook changes so installed MCP commands and project hooks can keep using the active checkout.
 - Run `Install.ps1 -Global` only with explicit user authorization.
 - Preserve user worktrees and uncommitted changes. Leave worktree cleanup to the user, and move individual files to the Recycle Bin when deletion is authorized.
+- Use `execution_mode: "direct"` to switch a slot to direct execution. Later tasks on that binding keep the mode until `execution_mode: "desktop"` or an automatic downgrade. Opening the direct chat in Codex App can take the write lock and trigger the downgrade on the next task.
 - Keep execution and history reads on separate connections. A direct turn keeps its slot and thread reserved until the writer exits. Queue once when resume returns an active-writer conflict before turn submission. Report that the queued turn uses the desktop chat's policy.
 - Keep approvals tied to the originating RPC connection and require the user's decision. Direct execution inherits Codex settings. For an explicitly requested restricted sandbox on Windows, pass MXC to the child process only.
 - Cross-process history may report an active turn as `interrupted` with no valid `completedAt`. Keep the task open until history records a valid completion time or a matching Interrupt hook confirms the interruption.
