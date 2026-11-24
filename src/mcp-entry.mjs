@@ -10,10 +10,11 @@ import {
 } from "./task-state.mjs";
 import { searchWorkspace } from "./workspace-search.mjs";
 import { excerpt, receiptInstruction, recentReplies, reportFields } from "./receipt.mjs";
+import { addWorktree, inspectWorktree, planWorktree } from "./worktree.mjs";
 
 const {
-  bindThread, CodexReader, openDatabase, queueTask,
-  startDesktop, threadIdFrom, transaction, workspacePath,
+  bindingWorktree, bindThread, CodexReader, defaultSession, getBinding, openDatabase, queueTask,
+  sameWorkspace, saveBinding, startDesktop, threadIdFrom, transaction, workspacePath,
 } = core;
 const [, , directory, statePath, codex] = process.argv;
 const workspace = workspacePath(directory);
@@ -28,6 +29,8 @@ const activeDispatches = new Set();
 const completedWatches = new Map();
 const completedWatchLimit = 1024;
 const codexTerminalStates = new Set(["reported", "no_report", "failed", "interrupted"]);
+const sessionNameParam = z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/).optional()
+  .describe("目标子会话名。省略时使用 default。");
 
 function conversationOwner(context) {
   const owner = context._meta?.["antigravity.google/root_conversation_id"];
@@ -41,6 +44,34 @@ function taskById(owner, id) {
   return database.prepare("SELECT * FROM tasks WHERE owner = ? AND id = ?").get(owner, id);
 }
 
+function taskInSession(owner, id, sessionName) {
+  const task = taskById(owner, id);
+  if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
+  if (task.session_name !== sessionName) throw new Error(`工单属于子会话 ${task.session_name}，请指定该子会话。`);
+  return task;
+}
+
+async function bindingOverview(owner) {
+  const rows = database.prepare("SELECT * FROM bindings WHERE owner = ? ORDER BY session_name").all(owner);
+  return Promise.all(rows.map(async row => {
+    let directory = row.workspace;
+    if (directory === null && row.thread_id) {
+      const current = await bindingStatus(database, owner, readThread, row.session_name);
+      if (current.bound_thread_id === row.thread_id) directory = current.bound_workspace;
+    }
+    return {
+      session_name: row.session_name, thread_id: row.thread_id, pending_task_id: row.pending_task_id,
+      workspace: directory, worktree: bindingWorktree(row),
+    };
+  }));
+}
+
+function worktreeNotice(worktree) {
+  if (!worktree) return null;
+  const branch = worktree.branch ? `（分支 ${worktree.branch}）` : "";
+  return `工作树已保留在 ${worktree.path}${branch}，请按需自行合并或清理。`;
+}
+
 function reply(data) {
   return { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data };
 }
@@ -50,10 +81,12 @@ function textReply(data) {
 }
 
 function reportStatus(task, watchState, extra = {}, reportMode = "none", turnTaskIds = taskIdsForTurn(database, task)) {
-  const binding = database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(task.owner);
+  const binding = getBinding(database, task.owner, task.session_name);
+  const worktree = binding?.workspace && sameWorkspace(binding.workspace, task.workspace) ? bindingWorktree(binding) : null;
   const render = reportMode === "none" ? reply : textReply;
   return render({
     task_id: task.id,
+    session_name: task.session_name,
     state: task.state,
     workspace: task.workspace,
     thread_id: task.thread_id,
@@ -68,6 +101,8 @@ function reportStatus(task, watchState, extra = {}, reportMode = "none", turnTas
     created_at: task.created_at,
     updated_at: task.updated_at,
     bound_thread_id: binding?.thread_id ?? null,
+    worktree,
+    ...(worktree && ["dismissed", "cancelled"].includes(task.state) && { worktree_note: worktreeNotice(worktree) }),
     can_follow_up: Boolean(task.thread_id && task.thread_id === binding?.thread_id && !["dismissed","cancelled"].includes(task.state)),
     ...(watchState && { watch_state: watchState }),
     ...extra,
@@ -109,17 +144,17 @@ function draftUri(directory, message) {
   return `codex://threads/new?${new URLSearchParams({ path: directory, prompt: message })}`;
 }
 
-function createTask(owner, prompt, target, explicitNewChat) {
-  const id = randomUUID();
+function createTask(id, owner, sessionName, prompt, target, explicitNewChat, pendingTaskId) {
   const markedPrompt = `[AGY Codex task: ${id}]\n\n${prompt}`;
   return transaction(database, () => {
-    const binding = database.prepare("SELECT * FROM bindings WHERE owner = ?").get(owner);
+    const binding = getBinding(database, owner, sessionName);
     if (!explicitNewChat && (binding?.thread_id ?? null) !== target.threadId) {
       throw new Error("当前绑定在派单前发生了变化，请确认目标会话。");
     }
-    if (!explicitNewChat && binding?.pending_task_id) {
+    if (binding?.pending_task_id) {
       const pending = taskById(owner, binding.pending_task_id);
-      if (pending && ongoing.has(pending.state)) return { pending };
+      if (pending && ongoing.has(pending.state) &&
+        (!explicitNewChat || binding.pending_task_id !== pendingTaskId || pending.state === "dispatching")) return { pending };
     }
     const newChat = !target.threadId;
     let message = markedPrompt + receiptInstruction;
@@ -131,16 +166,30 @@ function createTask(owner, prompt, target, explicitNewChat) {
       if (uri.length > 8000) throw new Error("首单超过桌面链接的长度上限。请压缩工单，把长材料留在工作目录并引用文件。");
     }
     database.prepare(`
-      INSERT INTO tasks (id, owner, workspace, thread_id, state, dispatch_deadline, draft_prompt)
-      VALUES (?, ?, ?, ?, 'dispatching', ?, ?)
-    `).run(id, owner, target.directory, target.threadId, Date.now() + dispatchLeaseMs, newChat ? message : null);
+      INSERT INTO tasks (id, owner, session_name, workspace, thread_id, state, dispatch_deadline, draft_prompt)
+      VALUES (?, ?, ?, ?, ?, 'dispatching', ?, ?)
+    `).run(id, owner, sessionName, target.directory, target.threadId, Date.now() + dispatchLeaseMs, newChat ? message : null);
     if (newChat) {
-      database.prepare(`
-        INSERT INTO bindings (owner, pending_task_id) VALUES (?, ?)
-        ON CONFLICT(owner) DO UPDATE SET thread_id = NULL, pending_task_id = excluded.pending_task_id
-      `).run(owner, id);
+      saveBinding(database, owner, sessionName, null, id, target.directory, target.worktree);
     }
-    return { id, message, uri };
+    return { id, message, uri, previousBinding: binding };
+  });
+}
+
+function failWorktreeDispatch(owner, sessionName, task, detail) {
+  transaction(database, () => {
+    database.prepare(`
+      UPDATE tasks SET state = 'dispatch_failed', detail = ?, dispatch_deadline = NULL, draft_prompt = NULL
+      WHERE id = ? AND state = 'dispatching'
+    `).run(detail, task.id);
+    if (getBinding(database, owner, sessionName)?.pending_task_id !== task.id) return;
+    const previous = task.previousBinding;
+    if (previous) {
+      saveBinding(database, owner, sessionName, previous.thread_id, previous.pending_task_id,
+        previous.workspace, bindingWorktree(previous));
+    } else {
+      database.prepare("DELETE FROM bindings WHERE owner = ? AND session_name = ?").run(owner, sessionName);
+    }
   });
 }
 
@@ -168,51 +217,63 @@ async function waitForResult(owner, taskId, waitSeconds, interval, signal) {
 
 server.registerTool("bind", {
   description: "将用户明确给出的本机 Codex 会话深链接或 UUID 绑定到当前 Antigravity 对话。只查询会话与目录，不派单。",
-  inputSchema: { session: z.string().min(1).max(200) },
-}, async ({ session }, context) => {
+  inputSchema: { session: z.string().min(1).max(200), session_name: sessionNameParam },
+}, async ({ session, session_name: sessionName = defaultSession }, context) => {
   const owner = conversationOwner(context);
   const threadId = threadIdFrom(session);
   const thread = await readThread(threadId);
-  bindThread(database, owner, threadId);
+  const worktree = await inspectWorktree(thread.directory);
+  const previous = bindingWorktree(getBinding(database, owner, sessionName));
+  if (worktree && previous && sameWorkspace(worktree.path, previous.path)) worktree.base_commit = previous.base_commit;
+  bindThread(database, owner, threadId, sessionName, thread.directory, worktree);
   return reply({
-    state: "bound", thread_id: threadId, workspace: thread.directory, name: thread.name,
+    state: "bound", session_name: sessionName, thread_id: threadId, workspace: thread.directory, name: thread.name, worktree,
     thread_url: `codex://threads/${threadId}`,
   });
 });
 
 server.registerTool("unbind", {
   description: "当用户说“取消绑定”或“解绑”时，清除当前 Antigravity 对话的 Codex 目标和待绑定请求。已发出的工单仍可查询。",
-  inputSchema: {},
-}, async (_args, context) => {
+  inputSchema: { session_name: sessionNameParam },
+}, async ({ session_name: sessionName = defaultSession }, context) => {
   const owner = conversationOwner(context);
   const binding = database.prepare(`
-    DELETE FROM bindings WHERE owner = ? RETURNING thread_id
-  `).get(owner);
+    DELETE FROM bindings WHERE owner = ? AND session_name = ? RETURNING *
+  `).get(owner, sessionName);
+  const worktree = bindingWorktree(binding);
   return reply({
     state: "unbound",
+    session_name: sessionName,
     previous_thread_id: binding?.thread_id ?? null,
-    detail: binding ? "已取消当前对话的 Codex 绑定。" : "当前对话没有绑定 Codex 会话。",
+    worktree,
+    worktree_note: worktreeNotice(worktree),
+    detail: binding ? "已取消目标子会话的 Codex 绑定。" : "目标子会话没有绑定 Codex 会话。",
   });
 });
 
 server.registerTool("submit", {
-  description: "发送工单。已绑定时投递到同一 Codex 会话，首次未绑定时在当前目录打开桌面新会话并预填，需用户点发送。只有用户明确要另开时才设置 new_chat。",
+  description: "向目标子会话发送工单。已绑定时入队，首单打开桌面草稿，需用户点发送。明确另开时设置 new_chat。可为新会话创建独立 Git 工作树。",
   inputSchema: {
     prompt: z.string().trim().min(1).max(12000),
     new_chat: z.boolean().optional(),
+    session_name: sessionNameParam,
+    worktree: z.boolean().optional().describe("为新会话创建独立 Git 工作树。"),
     follow_up_task_id: z.string().uuid().optional().describe("补单时传原工单 ID，以核对投递目标。"),
   },
-}, async ({ prompt, new_chat: newChat, follow_up_task_id: followUpTaskId }, context) => {
+}, async ({ prompt, new_chat: newChat, session_name: sessionName = defaultSession, worktree: isolated, follow_up_task_id: followUpTaskId }, context) => {
   const owner = conversationOwner(context);
-  const binding = database.prepare("SELECT * FROM bindings WHERE owner = ?").get(owner);
+  const binding = getBinding(database, owner, sessionName);
   let threadId = newChat ? null : binding?.thread_id ?? null;
-  if (followUpTaskId) threadId = validateFollowUp(database, owner, followUpTaskId, newChat);
-  const actualWorkspace = threadId ? (await readThread(threadId)).directory : workspace;
-  const task = createTask(owner, prompt, { directory: actualWorkspace, threadId }, newChat);
+  if (followUpTaskId) threadId = validateFollowUp(database, owner, followUpTaskId, newChat, sessionName);
+  if (threadId && isolated) throw new Error("只能为新会话创建工作树。请选择未绑定的子会话或明确另开会话。");
+  const id = randomUUID();
+  const worktree = isolated ? await planWorktree(workspace, id) : null;
+  const actualWorkspace = threadId ? (await readThread(threadId)).directory : worktree?.path ?? workspace;
+  const task = createTask(id, owner, sessionName, prompt, { directory: actualWorkspace, threadId, worktree }, newChat, binding?.pending_task_id);
   if (task.pending) {
     return reportStatus(task.pending, null, {
       new_task_dispatched: false,
-      detail: "未派发本次新单。当前对话已有未结束的首单，请查询、恢复或放弃原单。"
+      detail: "未派发本次新单。目标子会话已有未结束的首单，请查询、恢复或放弃原单。"
         + (task.pending.detail ?? ""),
     });
   }
@@ -220,6 +281,18 @@ server.registerTool("submit", {
   let detail = threadId ? "已入队，等待 Codex App 领取。" : "请在 Codex App 审核预填工单并点发送。";
   activeDispatches.add(task.id);
   try {
+    if (worktree) {
+      try {
+        await addWorktree(worktree);
+        if (getBinding(database, owner, sessionName)?.pending_task_id !== task.id) {
+          throw new Error("子会话在创建工作树期间已变更，未打开草稿。");
+        }
+      } catch (error) {
+        const failure = `${error.message} 工作树目标路径为 ${worktree.path}（分支 ${worktree.branch}）。`;
+        failWorktreeDispatch(owner, sessionName, task, failure);
+        return reportStatus(taskById(owner, task.id), null, { new_task_dispatched: false, worktree, detail: failure });
+      }
+    }
     if (threadId) await queueTask(codex, actualWorkspace, threadId, task.message);
     else await startDesktop(task.uri);
   } catch (error) {
@@ -240,31 +313,40 @@ server.registerTool("status", {
   description: "查询当前 Antigravity 工单的状态。默认只查进度；report_mode=summary 查简短结果，full 才取完整回执。可等待至多 25 秒。",
   inputSchema: {
     task_id: z.string().uuid().optional(),
+    session_name: sessionNameParam,
     wait_seconds: z.number().int().min(0).max(25).optional(),
     report_mode: z.enum(["none", "summary", "full"]).optional(),
   },
-}, async ({ task_id: taskId, wait_seconds: waitSeconds = 0, report_mode: reportMode = "none" }, context) => {
+}, async ({ task_id: taskId, session_name: sessionName = defaultSession, wait_seconds: waitSeconds = 0, report_mode: reportMode = "none" }, context) => {
   const owner = conversationOwner(context);
-  taskId ??= database.prepare("SELECT id FROM tasks WHERE owner = ? ORDER BY rowid DESC LIMIT 1").get(owner)?.id;
+  taskId ??= database.prepare("SELECT id FROM tasks WHERE owner = ? AND session_name = ? ORDER BY rowid DESC LIMIT 1")
+    .get(owner, sessionName)?.id;
   if (!taskId) {
-    const binding = await bindingStatus(database, owner, readThread);
+    const binding = await bindingStatus(database, owner, readThread, sessionName);
     return reply({
       state: "no_task",
+      session_name: sessionName,
       thread_id: binding.bound_thread_id,
       ...binding,
+      bindings: await bindingOverview(owner),
       new_chat_workspace: workspace,
-      detail: "当前对话还没有派单。",
+      detail: "目标子会话还没有派单。",
     });
   }
+  taskInSession(owner, taskId, sessionName);
   await waitForResult(owner, taskId, waitSeconds, 2000, context.signal);
-  const binding = await bindingStatus(database, owner, readThread);
-  return reportStatus(taskById(owner, taskId), null, binding, reportMode);
+  const binding = await bindingStatus(database, owner, readThread, sessionName);
+  const bindings = await bindingOverview(owner);
+  return reportStatus(taskById(owner, taskId), null, { ...binding, bindings }, reportMode);
 });
 
 server.registerTool("list_tasks", {
-  description: "列出当前对话最近的工单，包含状态、工作目录、时间与简要说明。",
-  inputSchema: { limit: z.number().int().min(1).max(100).default(10) },
-}, async ({ limit }, context) => reply({ tasks: listTasks(database, conversationOwner(context), limit) }));
+  description: "列出目标子会话最近的工单，以及当前对话的全部子会话绑定。",
+  inputSchema: { limit: z.number().int().min(1).max(100).default(10), session_name: sessionNameParam },
+}, async ({ limit, session_name: sessionName = defaultSession }, context) => {
+  const owner = conversationOwner(context);
+  return reply({ tasks: listTasks(database, owner, limit, sessionName), bindings: await bindingOverview(owner) });
+});
 
 server.registerTool("search_workspace", {
   description: "只读检索 Antigravity 当前工作区。files 找路径，docs 查文档，code 定位代码和配置，text 搜全部文本。path 限定相对路径，glob 可过滤文件。默认按字面匹配，文字结果返回行号和短片段。",
@@ -285,16 +367,16 @@ server.registerTool("search_workspace", {
 
 server.registerTool("recent_replies", {
   description: "按需查看当前 Antigravity 对话已绑定的 Codex 会话中最近的最终回复，默认三条、最多六条；无需工单，不会续写会话。",
-  inputSchema: z.strictObject({ limit: z.number().int().min(1).max(6).optional() }),
+  inputSchema: z.strictObject({ limit: z.number().int().min(1).max(6).optional(), session_name: sessionNameParam }),
   annotations: { readOnlyHint: true, openWorldHint: false },
-}, async ({ limit = 3 }, context) => {
+}, async ({ limit = 3, session_name: sessionName = defaultSession }, context) => {
   const owner = conversationOwner(context);
-  const current = () => database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner)?.thread_id;
+  const current = () => getBinding(database, owner, sessionName)?.thread_id;
   const threadId = current();
   if (!threadId) throw new Error("请先绑定要回看的 Codex 会话。");
   const replies = await recentReplies(reader, threadId, limit, context.signal);
   if (current() !== threadId) throw new Error("读取时绑定已变化，请核对会话后重试。");
-  return textReply({ thread_id: threadId, replies });
+  return textReply({ session_name: sessionName, thread_id: threadId, replies });
 });
 
 server.registerTool("dismiss", {
@@ -308,11 +390,12 @@ server.registerTool("dismiss", {
 
 server.registerTool("resume_draft", {
   description: "用户明确要求恢复未发送的首单时，在原目录重新打开带原标记的草稿，仍需手动发送。",
-  inputSchema: { task_id: z.string().uuid() },
-}, async ({ task_id: id }, context) => {
+  inputSchema: { task_id: z.string().uuid(), session_name: sessionNameParam },
+}, async ({ task_id: id, session_name: sessionName = defaultSession }, context) => {
   const owner = conversationOwner(context);
+  taskInSession(owner, id, sessionName);
   const task = await waitForResult(owner, id, 0, 0, context.signal);
-  const binding = database.prepare("SELECT pending_task_id FROM bindings WHERE owner = ?").get(owner);
+  const binding = getBinding(database, owner, sessionName);
   if (task.state !== "awaiting_send" || binding?.pending_task_id !== id) {
     throw new Error("只能恢复当前绑定中尚待发送的草稿。");
   }

@@ -7,7 +7,7 @@
 antigravity-codex-bridge connects Antigravity CLI and Codex App on your Windows PC so Gemini can coordinate and review work that Codex performs in your project.
 
 - Gemini prepares and dispatches tasks, waits in the background, checks results, and follows up on gaps. It receives a short receipt by default to save context and can fetch the full reply on request.
-- Open a new Codex chat or bind an existing one. Each Antigravity conversation keeps its own binding and can look back at recent replies in the bound chat.
+- Open or bind Codex chats in a default session and any number of named sessions. Independent tasks can run in separate Git worktrees.
 - Optional read-only `rg` search stays within the current Antigravity workspace and skips common sensitive files. Codex handles code review and long materials.
 - The bridge runs locally without a persistent background service. It keeps bindings and task records in SQLite and clears stored reply text from finished tasks after 30 days.
 
@@ -93,6 +93,14 @@ Bind this Codex chat codex://threads/00000000-0000-4000-8000-000000000001
 
 After Gemini confirms the binding and working folder, give Antigravity a task. Subsequent tasks go to that Codex chat's queue and use its working folder and model settings. If a task stays queued, open the target chat in Codex App.
 
+### Run tasks in parallel
+
+Keep using the default session for everyday work. For parallel work, ask Antigravity to send each task to a different named session, such as `docs` and `feature-a`. Name the same session when checking progress, reopening its draft, or following up. Ask for all bindings to see each session's chat and working directory. Existing bindings and tasks are assigned to `default` when the database upgrades.
+
+To isolate changes, ask for a new session in a Git worktree. Git must be on PATH and the current checkout must have a commit. The bridge creates a sibling of the main checkout named like `MyProject-agy-<task-id>`, on branch `agy/<task-id>` from the current checkout's HEAD. Uncommitted files stay in the current checkout. You can also bind a chat that already uses a worktree. Send each prepared first task in Codex App. Unbinding or dismissing a task leaves the worktree and branch on disk for you to merge or clean up.
+
+Project hooks are optional. To record worktree activity through hooks, run the hooks-only installer for the worktree path with the same state directory, then review and enable the hooks in Codex App.
+
 ### Everyday commands
 
 | What you want | What to do |
@@ -107,8 +115,6 @@ After Gemini confirms the binding and working folder, give Antigravity a task. S
 | Remove the current binding | Say “Unbind.” Previously dispatched tasks remain available to check. |
 | Switch to a new chat | Say “Start a new Codex chat for this task,” then send the prepared first message in the app. |
 | Resume after exiting | Use `/resume` to select the original Antigravity conversation. In the same folder, `agy --agent agydex -c` resumes the most recent conversation. To pick a specific one by ID, use `--conversation` followed by the ID. |
-
-Bindings are saved per Antigravity conversation. Conversations started from the same folder can target different Codex chats.
 
 With `rg.exe` on PATH, Gemini can search files, documents, code and configuration, or all text in the current Antigravity workspace. Try “Find references to `queueTask` under `src/` in `*.mjs` files.” Search supports a relative path, glob, case and whole-word matching, optional regular expressions, and up to two lines of context. Git-ignored files, symbolic links, common credentials, and lockfiles are skipped. Hidden project configuration such as `.github/` is searchable. A bound Codex chat in a different folder retains its own working directory. Ask Codex to inspect that folder or review lengthy material.
 

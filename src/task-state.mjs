@@ -2,7 +2,7 @@ import core from "../core.cjs";
 import { setTimeout as delay } from "node:timers/promises";
 import { finalMessage } from "./receipt.mjs";
 
-const { markAccepted, recordResult, taskMarker, transaction } = core;
+const { defaultSession, getBinding, markAccepted, recordResult, taskMarker, transaction } = core;
 
 // Both dispatch commands time out within 15 s. Give other processes time to record their result.
 export const dispatchLeaseMs = 30_000;
@@ -19,7 +19,7 @@ export function clearExpiredReports(database) {
 
 export function dismissTask(database, owner, id) {
   return transaction(database, () => {
-    const task = database.prepare("SELECT state FROM tasks WHERE owner = ? AND id = ?").get(owner, id);
+    const task = database.prepare("SELECT state, session_name FROM tasks WHERE owner = ? AND id = ?").get(owner, id);
     if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
     if (!ongoing.has(task.state)) return;
     const draft = task.state === "awaiting_send";
@@ -27,16 +27,17 @@ export function dismissTask(database, owner, id) {
       : "仅停止本地跟踪，不代表 Codex App 已撤回执行。";
     database.prepare("UPDATE tasks SET state = ?, detail = ?, draft_prompt = NULL WHERE id = ?")
       .run(draft ? "cancelled" : "dismissed", detail, id);
-    database.prepare("UPDATE bindings SET pending_task_id = NULL WHERE owner = ? AND pending_task_id = ?").run(owner, id);
+    database.prepare("UPDATE bindings SET pending_task_id = NULL WHERE owner = ? AND session_name = ? AND pending_task_id = ?")
+      .run(owner, task.session_name, id);
   });
 }
 
-export function listTasks(database, owner, limit) {
+export function listTasks(database, owner, limit, sessionName = defaultSession) {
   return database.prepare(`
-    SELECT id AS task_id, state, workspace, thread_id, created_at, updated_at,
+    SELECT id AS task_id, session_name, state, workspace, thread_id, created_at, updated_at,
       substr(coalesce(detail, report, ''), 1, 240) AS detail
-    FROM tasks WHERE owner = ? ORDER BY rowid DESC LIMIT ?
-  `).all(owner, limit);
+    FROM tasks WHERE owner = ? AND session_name = ? ORDER BY rowid DESC LIMIT ?
+  `).all(owner, sessionName, limit);
 }
 
 export function taskIdsForTurn(database, { owner, thread_id: threadId, turn_id: turnId }) {
@@ -46,8 +47,8 @@ export function taskIdsForTurn(database, { owner, thread_id: threadId, turn_id: 
   `).all(owner, threadId, turnId).map(({ id }) => id);
 }
 
-export async function bindingStatus(database, owner, readThread) {
-  const current = () => database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner)?.thread_id ?? null;
+export async function bindingStatus(database, owner, readThread, sessionName = defaultSession) {
+  const current = () => getBinding(database, owner, sessionName)?.thread_id ?? null;
   const id = current();
   let directory = null;
   if (id) {
@@ -84,12 +85,13 @@ async function* historyPages(reader, method, params) {
   }
 }
 
-export function validateFollowUp(database, owner, taskId, newChat) {
+export function validateFollowUp(database, owner, taskId, newChat, sessionName = defaultSession) {
   if (newChat) throw new Error("补单不能要求新开会话。");
-  const task = database.prepare("SELECT thread_id, state FROM tasks WHERE owner = ? AND id = ?").get(owner, taskId);
+  const task = database.prepare("SELECT thread_id, state, session_name FROM tasks WHERE owner = ? AND id = ?").get(owner, taskId);
   if (!task?.thread_id) throw new Error("当前对话没有这条已关联 Codex 会话的原工单，无法补单。");
+  if (task.session_name !== sessionName) throw new Error(`原工单属于子会话 ${task.session_name}，请在原子会话补单。`);
   if (task.state === "cancelled" || task.state === "dismissed") throw new Error("这条工单已停止跟踪，无法补单。");
-  const binding = database.prepare("SELECT thread_id FROM bindings WHERE owner = ?").get(owner);
+  const binding = getBinding(database, owner, sessionName);
   if (binding?.thread_id !== task.thread_id) throw new Error("当前已换绑或解绑，未向其他会话投递补单。");
   return task.thread_id;
 }
@@ -151,7 +153,7 @@ async function observeResult(database, reader, task) {
     if (turn.status === "failed") {
       state = "failed";
       detail = turn.error?.message ?? "Codex 回合失败。";
-    } else if (turn.status === "interrupted" && (turn.completedAt != null || turn.durationMs != null)) {
+    } else if (turn.status === "interrupted" && Number.isSafeInteger(turn.completedAt) && turn.completedAt > 0) {
       state = "interrupted";
       detail = "Codex 回合已中止。";
     } else if (turn.status === "completed") {

@@ -5,6 +5,19 @@ const { DatabaseSync } = require("node:sqlite");
 const { promisify } = require("node:util");
 
 const run = promisify(execFile);
+const defaultSession = "default";
+const bindingsSchema = `CREATE TABLE IF NOT EXISTS bindings (
+  owner TEXT NOT NULL,
+  session_name TEXT NOT NULL DEFAULT '${defaultSession}',
+  thread_id TEXT,
+  pending_task_id TEXT,
+  workspace TEXT,
+  repo_root TEXT,
+  worktree_path TEXT,
+  worktree_branch TEXT,
+  worktree_base_commit TEXT,
+  PRIMARY KEY (owner, session_name)
+)`;
 const uuid = "[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}";
 const taskMarker = new RegExp(`^\\[AGY Codex task: (${uuid})\\]\\r?\\n`, "i");
 // Clearing only a stored receipt is retention housekeeping, not a task update.
@@ -34,14 +47,11 @@ function openDatabase(path) {
   const database = new DatabaseSync(path);
   database.exec(`
     PRAGMA busy_timeout = 5000;
-    CREATE TABLE IF NOT EXISTS bindings (
-      owner TEXT PRIMARY KEY,
-      thread_id TEXT,
-      pending_task_id TEXT
-    );
+    ${bindingsSchema};
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       owner TEXT NOT NULL,
+      session_name TEXT NOT NULL DEFAULT '${defaultSession}',
       workspace TEXT NOT NULL,
       thread_id TEXT,
       turn_id TEXT,
@@ -54,11 +64,24 @@ function openDatabase(path) {
       updated_at TEXT
     );
   `);
-  const columns = { dispatch_deadline: "INTEGER", draft_prompt: "TEXT", created_at: "TEXT", updated_at: "TEXT" };
+  const columns = {
+    dispatch_deadline: "INTEGER", draft_prompt: "TEXT", created_at: "TEXT", updated_at: "TEXT",
+    session_name: `TEXT NOT NULL DEFAULT '${defaultSession}'`,
+  };
   const tableColumns = () => new Set(database.prepare("PRAGMA table_info(tasks)").all().map((col) => col.name));
+  const legacyBindings = () => !database.prepare("PRAGMA table_info(bindings)").all().some((col) => col.name === "session_name");
   const existing = tableColumns();
-  if (Object.keys(columns).some((name) => !existing.has(name))) {
+  if (legacyBindings() || Object.keys(columns).some((name) => !existing.has(name))) {
     transaction(database, () => {
+      if (legacyBindings()) {
+        database.exec(`
+          ALTER TABLE bindings RENAME TO legacy_bindings;
+          ${bindingsSchema};
+          INSERT INTO bindings (owner, thread_id, pending_task_id)
+            SELECT owner, thread_id, pending_task_id FROM legacy_bindings;
+          DROP TABLE legacy_bindings;
+        `);
+      }
       const current = tableColumns();
       for (const [name, type] of Object.entries(columns)) {
         if (!current.has(name)) database.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${type}`);
@@ -97,11 +120,33 @@ function transaction(database, operation) {
   }
 }
 
-function bindThread(database, owner, threadId) {
+function getBinding(database, owner, sessionName = defaultSession) {
+  return database.prepare("SELECT * FROM bindings WHERE owner = ? AND session_name = ?").get(owner, sessionName);
+}
+
+function saveBinding(database, owner, sessionName, threadId, pendingTaskId, workspace, worktree) {
   database.prepare(`
-    INSERT INTO bindings (owner, thread_id) VALUES (?, ?)
-    ON CONFLICT(owner) DO UPDATE SET thread_id = excluded.thread_id, pending_task_id = NULL
-  `).run(owner, threadId);
+    INSERT INTO bindings (owner, session_name, thread_id, pending_task_id, workspace,
+      repo_root, worktree_path, worktree_branch, worktree_base_commit)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(owner, session_name) DO UPDATE SET thread_id = excluded.thread_id,
+      pending_task_id = excluded.pending_task_id, workspace = excluded.workspace,
+      repo_root = excluded.repo_root, worktree_path = excluded.worktree_path,
+      worktree_branch = excluded.worktree_branch, worktree_base_commit = excluded.worktree_base_commit
+  `).run(owner, sessionName, threadId, pendingTaskId, workspace,
+    worktree?.repo_root ?? null, worktree?.path ?? null, worktree?.branch ?? null, worktree?.base_commit ?? null);
+}
+
+function bindThread(database, owner, threadId, sessionName = defaultSession, workspace = null, worktree = null) {
+  saveBinding(database, owner, sessionName, threadId, null, workspace, worktree);
+}
+
+function bindingWorktree(binding) {
+  if (!binding?.worktree_path) return null;
+  return {
+    repo_root: binding.repo_root, path: binding.worktree_path,
+    branch: binding.worktree_branch, base_commit: binding.worktree_base_commit,
+  };
 }
 
 function markAccepted(database, taskId, threadId, turnId) {
@@ -112,8 +157,10 @@ function markAccepted(database, taskId, threadId, turnId) {
   `).run(threadId, turnId, taskId, threadId);
   if (update.changes) {
     database.prepare(`
-      UPDATE bindings SET thread_id = ?, pending_task_id = NULL WHERE pending_task_id = ?
-    `).run(threadId, taskId);
+      UPDATE bindings SET thread_id = ?, pending_task_id = NULL,
+        workspace = (SELECT workspace FROM tasks WHERE id = ?)
+      WHERE pending_task_id = ? AND (owner, session_name) = (SELECT owner, session_name FROM tasks WHERE id = ?)
+    `).run(threadId, taskId, taskId, taskId);
   }
 }
 
@@ -222,6 +269,6 @@ class CodexReader {
 }
 
 module.exports = {
-  bindThread, CodexReader, markAccepted, openDatabase, queueTask, recordResult,
+  bindingWorktree, bindThread, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask, recordResult, saveBinding,
   sameWorkspace, startDesktop, taskMarker, threadIdFrom, transaction, workspacePath,
 };

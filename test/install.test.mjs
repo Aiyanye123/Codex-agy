@@ -203,7 +203,8 @@ test("hooks-only updates a known old hook while protecting a different command",
   const current = stop.command;
   const prefix = current.slice(0, current.lastIndexOf(" ") + 1);
   const script = Buffer.from(current.slice(prefix.length), "base64").toString("utf16le");
-  const previous = script.replace(path.join(scratch, "state/bridge.sqlite"), "C:\\older\\bridge.sqlite");
+  const previous = script.replace(path.join(scratch, "state/bridge.sqlite"), "C:\\older\\bridge.sqlite")
+    .replace("\nexit $LASTEXITCODE", ` '${workspace}'\nexit $LASTEXITCODE`);
   assert.notEqual(previous, script);
   stop.command = prefix + Buffer.from(previous, "utf16le").toString("base64");
   stop.timeout = 5;

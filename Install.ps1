@@ -23,15 +23,20 @@ function PowerShellLiteral([string]$Value) {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
-function Test-ManagedHook([string]$Command, [string]$ExpectedScript, [string]$QuotedNode, [string]$QuotedState) {
+function Test-ManagedHook([string]$Command, [string]$ExpectedScript, [string]$QuotedNode, [string]$QuotedState, [string]$QuotedProject) {
     if ($Command -notmatch '^powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ([A-Za-z0-9+/=]+)$') { return $false }
     try { $scriptText = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])) }
     catch [FormatException] { return $false }
-    # Only the Node executable and state directory may vary in an older installed command.
+    $scriptText = $scriptText.Replace("`r`n", "`n")
+    $exitLine = "`n" + 'exit $LASTEXITCODE'
+    $legacySuffix = " $QuotedProject" + $exitLine
+    if ($scriptText.EndsWith($legacySuffix, [StringComparison]::OrdinalIgnoreCase)) {
+        $scriptText = $scriptText.Substring(0, $scriptText.Length - $legacySuffix.Length) + $exitLine
+    }
     $pattern = [regex]::Escape($ExpectedScript.Replace("`r`n", "`n"))
     $pattern = $pattern.Replace([regex]::Escape($QuotedNode), "'(?:[^'`r`n]|'')+[\\/]node\.exe'")
     $pattern = $pattern.Replace([regex]::Escape($QuotedState), "'(?:[^'`r`n]|'')+[\\/]bridge\.sqlite'")
-    return $scriptText.Replace("`r`n", "`n") -match ("\A" + $pattern + "\z")
+    return $scriptText -match ("\A" + $pattern + "\z")
 }
 
 function Get-TextFingerprint([string]$Text) {
@@ -68,7 +73,7 @@ $writeHooks = $false
 if (!$Global) {
     $hooksPath = Join-Path $project '.codex/hooks.json'
     $hooks = Read-JsonObject $hooksPath
-    $quotedArgs = @($node, $hook, $state, $project) | ForEach-Object { PowerShellLiteral $_ }
+    $quotedArgs = @($node, $hook, $state) | ForEach-Object { PowerShellLiteral $_ }
     $hookScript = @'
 $encoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = $encoding
@@ -76,7 +81,7 @@ $encoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = $encoding
 $payload = [Console]::In.ReadToEnd()
 '@
-    $hookScript += "`n" + '$payload | & ' + $quotedArgs[0] + ' --disable-warning=ExperimentalWarning ' + ($quotedArgs[1..3] -join ' ')
+    $hookScript += "`n" + '$payload | & ' + $quotedArgs[0] + ' --disable-warning=ExperimentalWarning ' + ($quotedArgs[1..2] -join ' ')
     $hookScript += "`n" + 'exit $LASTEXITCODE'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($hookScript))
     $hookCommand = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
@@ -95,7 +100,7 @@ $payload = [Console]::In.ReadToEnd()
                 throw "A different AGY Codex Bridge hook already exists in $hooksPath"
             }
             if ($existing[0].command -cne $hookCommand) {
-                if (!(Test-ManagedHook $existing[0].command $hookScript $quotedArgs[0] $quotedArgs[2])) {
+                if (!(Test-ManagedHook $existing[0].command $hookScript $quotedArgs[0] $quotedArgs[2] (PowerShellLiteral $project))) {
                     throw "Custom AGY Codex Bridge hook preserved in $hooksPath."
                 }
                 $existing[0].command = $hookCommand

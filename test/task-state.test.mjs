@@ -38,7 +38,7 @@ for (const [label, status, completedAt, messages, state, report] of [
 ]) {
   test(label, async (t) => {
     const { db, task, userMessage } = fixture(t);
-    const turn = { id: "turn-a", status, completedAt, durationMs: null, items: [userMessage, ...messages] };
+    const turn = { id: "turn-a", status, completedAt, durationMs: 50, items: [userMessage, ...messages] };
     await refreshTask(db, history([turn]), task(), new Set());
     assert.equal(task().turn_id, turn.id);
     assert.equal(task().state, state);
