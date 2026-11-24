@@ -163,6 +163,9 @@ if (!$HooksOnly) {
             bind = @{ eager = $true }
             unbind = @{ eager = $true }
             submit = @{ eager = $true }
+            steer = @{ eager = $true }
+            interrupt = @{ eager = $true }
+            approve = @{ eager = $true }
             resume_draft = @{ eager = $true }
             dismiss = @{ eager = $true }
             list_tasks = @{ eager = $true }

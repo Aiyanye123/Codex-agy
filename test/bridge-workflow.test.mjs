@@ -298,7 +298,7 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
     return response.structuredContent ?? JSON.parse(response.content[0].text);
   };
   try {
-    const draft = await call("submit", { prompt: "original" });
+    const draft = await call("submit", { prompt: "original", execution_mode: "desktop" });
     const args = { task_id: draft.task_id };
     const blocked = await call("submit", { prompt: "other" });
     assert.equal(blocked.new_task_dispatched, false);
@@ -311,10 +311,10 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
     const waiting = call("watch", args);
     assert.equal((await call("dismiss", args)).state, "cancelled");
     assert.equal((await waiting).state, "cancelled");
-    const next = await call("submit", { prompt: "next" });
+    const next = await call("submit", { prompt: "next", execution_mode: "desktop" });
     assert.notEqual(next.task_id, draft.task_id);
     assert.equal((await call("status", args)).bound_workspace, null);
-    const nearLimit = await call("submit", { prompt: "x".repeat(7800), new_chat: true });
+    const nearLimit = await call("submit", { prompt: "x".repeat(7800), new_chat: true, execution_mode: "desktop" });
     assert.equal(nearLimit.state, "awaiting_send");
   } finally { await client.close(); }
 });

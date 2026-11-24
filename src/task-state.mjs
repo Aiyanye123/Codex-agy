@@ -6,21 +6,55 @@ const { defaultSession, getBinding, markAccepted, recordResult, taskMarker, tran
 
 // Both dispatch commands time out within 15 s. Give other processes time to record their result.
 export const dispatchLeaseMs = 30_000;
-export const ongoing = new Set(["dispatching", "dispatch_unknown", "awaiting_send", "queued", "running"]);
+export const waitingForUser = new Set(["waiting_approval", "waiting_user_input"]);
+export const ongoing = new Set(["dispatching", "dispatch_unknown", "awaiting_send", "queued", "running", "finishing", ...waitingForUser]);
+
+export function releaseAbandonedWriter(database, task) {
+  if (!task.writer_pid) return false;
+  try {
+    process.kill(task.writer_pid, 0);
+    return false;
+  } catch (error) {
+    if (error.code !== "ESRCH") return false;
+  }
+  const pending = ongoing.has(task.state);
+  database.prepare(`
+    UPDATE tasks SET writer_pid = NULL, approvals_json = NULL, dispatch_deadline = NULL, state = ?, detail = ?
+    WHERE id = ? AND writer_pid = ?
+  `).run(pending ? "dispatch_unknown" : task.state,
+    pending ? "原直连执行进程已退出。正在通过原工单记录核对结果，请勿重复派单。" : task.detail,
+    task.id, task.writer_pid);
+  return true;
+}
+
+export function assertNoDirectWriter(database, owner, sessionName, threadId = null) {
+  const writers = database.prepare(`
+    SELECT id, writer_pid, state, detail FROM tasks
+    WHERE writer_pid IS NOT NULL AND ((owner = ? AND session_name = ?) OR thread_id = ?)
+  `).all(owner, sessionName, threadId);
+  for (const writer of writers) {
+    if (!releaseAbandonedWriter(database, writer)) {
+      throw new Error("该子会话或线程已有直连工单在运行。请查看原工单，按需使用 steer 或 interrupt。");
+    }
+  }
+}
 
 export function clearExpiredReports(database) {
   const nonterminal = [...ongoing];
   database.prepare(`
-    UPDATE tasks SET report = NULL
-    WHERE report IS NOT NULL AND state NOT IN (${nonterminal.map(() => "?").join(", ")})
+    UPDATE tasks SET report = NULL, tool_results_json = NULL
+    WHERE (report IS NOT NULL OR tool_results_json IS NOT NULL) AND state NOT IN (${nonterminal.map(() => "?").join(", ")})
       AND julianday(coalesce(updated_at, created_at)) < julianday('now', '-30 days')
   `).run(...nonterminal);
 }
 
 export function dismissTask(database, owner, id) {
   return transaction(database, () => {
-    const task = database.prepare("SELECT state, session_name FROM tasks WHERE owner = ? AND id = ?").get(owner, id);
+    const task = database.prepare("SELECT id, state, detail, session_name, writer_pid FROM tasks WHERE owner = ? AND id = ?").get(owner, id);
     if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
+    if (task.writer_pid && !releaseAbandonedWriter(database, task)) {
+      throw new Error("直连工单仍在运行。请使用 interrupt 中断，或等待执行结束。");
+    }
     if (!ongoing.has(task.state)) return;
     const draft = task.state === "awaiting_send";
     const detail = draft ? "已放弃本地草稿。请关闭 App 中的预填消息。"
@@ -35,9 +69,11 @@ export function dismissTask(database, owner, id) {
 export function listTasks(database, owner, limit, sessionName = defaultSession) {
   return database.prepare(`
     SELECT id AS task_id, session_name, state, workspace, thread_id, created_at, updated_at,
-      substr(coalesce(detail, report, ''), 1, 240) AS detail
+      execution_mode, desktop_fallback, approvals_json, substr(coalesce(detail, report, ''), 1, 240) AS detail
     FROM tasks WHERE owner = ? AND session_name = ? ORDER BY rowid DESC LIMIT ?
-  `).all(owner, sessionName, limit);
+  `).all(owner, sessionName, limit).map(({ approvals_json, desktop_fallback, ...task }) => ({
+    ...task, desktop_fallback: Boolean(desktop_fallback), approvals: approvals_json ? JSON.parse(approvals_json) : [],
+  }));
 }
 
 export function taskIdsForTurn(database, { owner, thread_id: threadId, turn_id: turnId }) {
@@ -169,6 +205,7 @@ async function observeResult(database, reader, task) {
 }
 
 export async function refreshTask(database, reader, task, activeDispatches) {
+  if (task.writer_pid) return;
   if (task.state !== "dispatching") {
     await observeResult(database, reader, task);
     return;

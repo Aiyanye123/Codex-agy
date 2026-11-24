@@ -16,6 +16,7 @@ const bindingsSchema = `CREATE TABLE IF NOT EXISTS bindings (
   worktree_path TEXT,
   worktree_branch TEXT,
   worktree_base_commit TEXT,
+  execution_mode TEXT NOT NULL DEFAULT 'desktop',
   PRIMARY KEY (owner, session_name)
 )`;
 const uuid = "[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}";
@@ -60,6 +61,11 @@ function openDatabase(path) {
       detail TEXT,
       dispatch_deadline INTEGER,
       draft_prompt TEXT,
+      execution_mode TEXT NOT NULL DEFAULT 'desktop',
+      desktop_fallback INTEGER NOT NULL DEFAULT 0,
+      writer_pid INTEGER,
+      approvals_json TEXT,
+      tool_results_json TEXT,
       created_at TEXT,
       updated_at TEXT
     );
@@ -67,13 +73,19 @@ function openDatabase(path) {
   const columns = {
     dispatch_deadline: "INTEGER", draft_prompt: "TEXT", created_at: "TEXT", updated_at: "TEXT",
     session_name: `TEXT NOT NULL DEFAULT '${defaultSession}'`,
+    execution_mode: "TEXT NOT NULL DEFAULT 'desktop'",
+    desktop_fallback: "INTEGER NOT NULL DEFAULT 0",
+    writer_pid: "INTEGER",
+    approvals_json: "TEXT",
+    tool_results_json: "TEXT",
   };
   const tableColumns = () => new Set(database.prepare("PRAGMA table_info(tasks)").all().map((col) => col.name));
-  const legacyBindings = () => !database.prepare("PRAGMA table_info(bindings)").all().some((col) => col.name === "session_name");
+  const bindingColumns = () => new Set(database.prepare("PRAGMA table_info(bindings)").all().map((col) => col.name));
   const existing = tableColumns();
-  if (legacyBindings() || Object.keys(columns).some((name) => !existing.has(name))) {
+  if (!bindingColumns().has("execution_mode") || Object.keys(columns).some((name) => !existing.has(name))) {
     transaction(database, () => {
-      if (legacyBindings()) {
+      const currentBindings = bindingColumns();
+      if (!currentBindings.has("session_name")) {
         database.exec(`
           ALTER TABLE bindings RENAME TO legacy_bindings;
           ${bindingsSchema};
@@ -81,6 +93,8 @@ function openDatabase(path) {
             SELECT owner, thread_id, pending_task_id FROM legacy_bindings;
           DROP TABLE legacy_bindings;
         `);
+      } else if (!currentBindings.has("execution_mode")) {
+        database.exec("ALTER TABLE bindings ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'desktop'");
       }
       const current = tableColumns();
       for (const [name, type] of Object.entries(columns)) {
@@ -89,6 +103,8 @@ function openDatabase(path) {
     });
   }
   database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS direct_writer_slot ON tasks(owner, session_name) WHERE writer_pid IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS direct_writer_thread ON tasks(thread_id) WHERE writer_pid IS NOT NULL;
     CREATE TRIGGER IF NOT EXISTS task_created AFTER INSERT ON tasks BEGIN
       UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = NEW.id;
@@ -124,17 +140,18 @@ function getBinding(database, owner, sessionName = defaultSession) {
   return database.prepare("SELECT * FROM bindings WHERE owner = ? AND session_name = ?").get(owner, sessionName);
 }
 
-function saveBinding(database, owner, sessionName, threadId, pendingTaskId, workspace, worktree) {
+function saveBinding(database, owner, sessionName, threadId, pendingTaskId, workspace, worktree, executionMode = "desktop") {
   database.prepare(`
     INSERT INTO bindings (owner, session_name, thread_id, pending_task_id, workspace,
-      repo_root, worktree_path, worktree_branch, worktree_base_commit)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      repo_root, worktree_path, worktree_branch, worktree_base_commit, execution_mode)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(owner, session_name) DO UPDATE SET thread_id = excluded.thread_id,
       pending_task_id = excluded.pending_task_id, workspace = excluded.workspace,
       repo_root = excluded.repo_root, worktree_path = excluded.worktree_path,
-      worktree_branch = excluded.worktree_branch, worktree_base_commit = excluded.worktree_base_commit
+      worktree_branch = excluded.worktree_branch, worktree_base_commit = excluded.worktree_base_commit,
+      execution_mode = excluded.execution_mode
   `).run(owner, sessionName, threadId, pendingTaskId, workspace,
-    worktree?.repo_root ?? null, worktree?.path ?? null, worktree?.branch ?? null, worktree?.base_commit ?? null);
+    worktree?.repo_root ?? null, worktree?.path ?? null, worktree?.branch ?? null, worktree?.base_commit ?? null, executionMode);
 }
 
 function bindThread(database, owner, threadId, sessionName = defaultSession, workspace = null, worktree = null) {
@@ -149,12 +166,12 @@ function bindingWorktree(binding) {
   };
 }
 
-function markAccepted(database, taskId, threadId, turnId) {
+function markAccepted(database, taskId, threadId, turnId, writerPid = null) {
   const update = database.prepare(`
     UPDATE tasks SET thread_id = ?, turn_id = ?, state = 'running', detail = NULL, draft_prompt = NULL
-    WHERE id = ? AND turn_id IS NULL AND (thread_id IS NULL OR thread_id = ?)
+    WHERE id = ? AND turn_id IS NULL AND writer_pid IS ? AND (thread_id IS NULL OR thread_id = ?)
       AND state IN ('awaiting_send','dispatching','queued','dispatch_unknown','running')
-  `).run(threadId, turnId, taskId, threadId);
+  `).run(threadId, turnId, taskId, writerPid, threadId);
   if (update.changes) {
     database.prepare(`
       UPDATE bindings SET thread_id = ?, pending_task_id = NULL,
@@ -166,7 +183,8 @@ function markAccepted(database, taskId, threadId, turnId) {
 
 function recordResult(database, taskId, state, report, detail = null) {
   database.prepare(`
-    UPDATE tasks SET state = ?, report = ?, detail = ? WHERE id = ? AND state = 'running'
+    UPDATE tasks SET state = ?, report = ?, detail = ?
+    WHERE id = ? AND writer_pid IS NULL AND turn_id IS NOT NULL AND state IN ('running','dispatch_unknown')
   `).run(state, report, detail, taskId);
 }
 

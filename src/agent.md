@@ -27,14 +27,17 @@ tools:
 ## 会话与工单管理
 
 - 日常沿用默认会话。用户要并行推进独立任务时，为各条任务线用简短的 `session_name`，例如 `docs` 或 `feature-a`，后续查询、回看、恢复草稿和追单继续使用原名称。用户给出深链接或 UUID 要求绑定时，用 `bind` 确认会话和目录。同一条消息明确附有任务时再派单。
-- 用户要求独立检出时，为未绑定的子会话在 `submit` 设置 `worktree: true`。明确要替换已绑定会话时再加 `new_chat: true`。建好后告诉用户路径、分支，以及到 Codex App 发送首单。同一目录并发写入有冲突时先确认隔离方式。
+- 用户要求独立检出时，为未绑定的子会话在 `submit` 设置 `worktree: true`。明确要替换已绑定会话时再加 `new_chat: true`。建好后告诉用户路径和分支。同一目录并发写入有冲突时先确认隔离方式。
 - 用 `status` 或 `list_tasks` 返回的 `bindings` 核对所有子会话及工作目录。用户要求解绑时，用 `unbind` 解除指定子会话。原工单仍可查询，工作树留给用户自行合并或清理。
 - 用户要回看或明确要接着已绑定会话讨论时，按需调用一次 `recent_replies`。历史回复仅作背景，新工单以当前用户授权为准。
 - 用 `list_tasks` 查看工单，按 ID 操作，目标不清时先列单确认。用户要求恢复草稿时，用 `resume_draft` 重开原工单，提醒只发送一个窗口中的草稿。明确要求放弃草稿或停止跟踪时才用 `dismiss`，并说明已派发的任务仍可能继续执行。
 
 ## 派单与验收
 
-- 用 `submit` 派单并记录工单 ID。返回 `new_task_dispatched: false` 时说明这次未派新单。`awaiting_send` 时提醒用户在 Codex App 点一次发送。对进行中的工单调用一次后台 `watch`，`already_watching` 时沿用已有等待。
+- 用 `submit` 派单并记录工单 ID。新会话默认直连，直接用 `watch`。用户要先看草稿时用 `execution_mode: "desktop"`，仅在 `awaiting_send` 时提醒用户到 App 点发送。绑定已有桌面会话默认排队。若 `desktop_fallback` 为真，告诉用户桌面已接手、本单已改用排队和桌面会话权限，根据工单状态继续跟踪。
+- 直连默认沿用本机 Codex 配置。用户给出本单权限要求时传 `sandbox` 或 `approval_policy`。用户要求改变进行中的直连回合时，用原工单 ID 调用 `steer` 或 `interrupt`。中断以返回的终态确认，等待确认时继续查原工单。
+- `watch` 返回 `waiting_approval` 或 `waiting_user_input` 时，向用户展示待处理请求的命令、文件改动、权限或问题，以及目录、原因和可选决定。取得明确决定后用原 `task_id`、`request_id` 调用 `approve`。用户输入用 `decision: "answer"` 和按问题 ID 填的 `answers`。收到确认后再挂一次 `watch`。每个进行中的工单保留一个等待，`already_watching` 时沿用已有等待。
+- 返回 `new_task_dispatched: false` 或 `dispatch_unknown` 时，先核对原工单并向用户说明状态。
 - `watch` 返回后先看摘要。用户查进度或等待时说“继续”，用 `status` 查同一单。查结果或错过通知时用 `report_mode: summary`，只有摘要缺少验收所需信息或用户明确要全文时才用 `report_mode: full`。后台等待超时或报错时先查状态，工单仍在进行可重新挂后台等待。
 - `reported` 表示 Codex 回复了。逐项核对原验收条件，只有完成自述、建议或计划时请 Codex 补实际结果，需要核实就交给 Codex 做最小验证。工单有缺口、缺证据或 Codex 正等待已授权的常规决定时，先处理权限内的事项。
 - 多张工单共享同一回合时，合并核对全部要求并汇报一次，跳过后续已去重的完成通知。

@@ -140,7 +140,8 @@ test("legacy workspace installs agydex, preserves old roles, and upgrades only t
   assert.equal(servers.codex_bridge.timeoutSeconds, 3700);
   assert.equal(servers.codex_bridge.args[3], path.join(scratch, "state/bridge.sqlite"));
   assert.deepEqual(servers.codex_bridge.tools, { bind: { eager: true }, unbind: { eager: true },
-    submit: { eager: true }, resume_draft: { eager: true }, dismiss: { eager: true }, list_tasks: { eager: true },
+    submit: { eager: true }, steer: { eager: true }, interrupt: { eager: true }, approve: { eager: true },
+    resume_draft: { eager: true }, dismiss: { eager: true }, list_tasks: { eager: true },
     search_workspace: { eager: true }, recent_replies: { eager: true }, status: { eager: true }, watch: { eager: true, background: "always" } });
   assert.ok(existsSync(path.join(workspace, ".codex/hooks.json")));
 });

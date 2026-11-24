@@ -21,15 +21,16 @@ Set up these tools on the same Windows computer, then sign in to Antigravity and
 | Node.js 22.13 or newer, with 24 LTS recommended | [Node.js downloads](https://nodejs.org/en/download) |
 | Antigravity CLI, preferably 1.5.13 or newer | [Google Antigravity installation guide](https://antigravity.google/docs/cli/tutorial) |
 | Codex App, or Codex in the ChatGPT desktop app | [OpenAI's Windows desktop installation guide](https://learn.chatgpt.com/docs/windows/windows-app) |
-| Codex CLI with `queue` support, preferably from the standalone Windows installer | [OpenAI's Codex CLI installation guide](https://learn.chatgpt.com/docs/cli) |
+| Codex CLI with `app-server` and `queue` support, preferably from the standalone Windows installer | [OpenAI's Codex CLI installation guide](https://learn.chatgpt.com/docs/cli) |
 
-Open a new **PowerShell 7** window and check the commands below. `Get-Command` should find `codex.exe`, and `codex.exe queue --help` should show `--thread` and `--message`. The verified combination uses Antigravity CLI 1.5.13, Codex CLI 0.166.0, and Node.js 24.18.0.
+Open a new **PowerShell 7** window and check the commands below. `Get-Command` should find `codex.exe`, and `codex.exe queue --help` should show `--thread` and `--message`. The direct execution protocol uses Codex CLI 0.171.0.
 
 ```powershell
 node --version
 agy --version
 Get-Command codex.exe
 codex.exe queue --help
+codex.exe app-server --help
 ```
 
 ### Install manually
@@ -79,9 +80,7 @@ agy --agent agydex
 
 Give Antigravity a task, such as “Ask Codex to inspect this folder and briefly explain the main files. Leave the files as they are.”
 
-1. The bridge opens a new chat for the current folder in Codex App and fills in the task Gemini prepared.
-2. Review the text, keep the `[AGY Codex task: …]` marker at the top, and click **Send**. You can select a model in Codex App first.
-3. Leave the Antigravity conversation open. The bridge saves the binding when it finds the new Codex chat and returns the reply to Gemini for review.
+The bridge starts a new Codex chat in direct mode and sends the first task immediately. Keep Antigravity open for approval requests and the final receipt. To review the first message or pick a model in the app, ask for a desktop draft. Review the text, keep the task marker, then click **Send**.
 
 ### Bind an existing Codex chat
 
@@ -93,11 +92,17 @@ Bind this Codex chat codex://threads/00000000-0000-4000-8000-000000000001
 
 After Gemini confirms the binding and working folder, give Antigravity a task. Subsequent tasks go to that Codex chat's queue and use its working folder and model settings. If a task stays queued, open the target chat in Codex App.
 
+### Direct execution and approvals
+
+Direct turns use Codex's local settings unless you explicitly request a different `sandbox` or `approval_policy`. An explicit read-only or workspace-write sandbox uses MXC for the child process on Windows. You can ask Gemini to steer or interrupt an active direct turn. When Codex asks for approval or an answer, Gemini shows the specific request, sends your decision through `approve`, and resumes waiting.
+
+The bridge releases the write connection when a direct turn finishes. If Codex App already holds the write connection when the next task arrives, the bridge queues the task once and reports the switch to desktop mode. The desktop chat's sandbox and approval settings apply to that task.
+
 ### Run tasks in parallel
 
 Keep using the default session for everyday work. For parallel work, ask Antigravity to send each task to a different named session, such as `docs` and `feature-a`. Name the same session when checking progress, reopening its draft, or following up. Ask for all bindings to see each session's chat and working directory. Existing bindings and tasks are assigned to `default` when the database upgrades.
 
-To isolate changes, ask for a new session in a Git worktree. Git must be on PATH and the current checkout must have a commit. The bridge creates a sibling of the main checkout named like `MyProject-agy-<task-id>`, on branch `agy/<task-id>` from the current checkout's HEAD. Uncommitted files stay in the current checkout. You can also bind a chat that already uses a worktree. Send each prepared first task in Codex App. Unbinding or dismissing a task leaves the worktree and branch on disk for you to merge or clean up.
+To isolate changes, ask for a new session in a Git worktree. Git must be on PATH and the current checkout must have a commit. The bridge creates a sibling of the main checkout named like `MyProject-agy-<task-id>`, on branch `agy/<task-id>` from the current checkout's HEAD. Uncommitted files stay in the current checkout. You can also bind a chat that already uses a worktree. Unbinding or dismissing a task leaves the worktree and branch on disk for you to merge or clean up.
 
 Project hooks are optional. To record worktree activity through hooks, run the hooks-only installer for the worktree path with the same state directory, then review and enable the hooks in Codex App.
 
@@ -113,7 +118,7 @@ Project hooks are optional. To record worktree activity through hooks, run the h
 | Abandon a draft or stop tracking | Give the task ID and say “Abandon this draft” or “Stop tracking.” Close any abandoned draft in the app. A task already sent to Codex can keep running. |
 | Switch to another existing chat | Send the new Codex chat link and ask to bind it. |
 | Remove the current binding | Say “Unbind.” Previously dispatched tasks remain available to check. |
-| Switch to a new chat | Say “Start a new Codex chat for this task,” then send the prepared first message in the app. |
+| Switch to a new chat | Say “Start a new Codex chat for this task.” Ask for a desktop draft if you want to review it before sending. |
 | Resume after exiting | Use `/resume` to select the original Antigravity conversation. In the same folder, `agy --agent agydex -c` resumes the most recent conversation. To pick a specific one by ID, use `--conversation` followed by the ID. |
 
 With `rg.exe` on PATH, Gemini can search files, documents, code and configuration, or all text in the current Antigravity workspace. Try “Find references to `queueTask` under `src/` in `*.mjs` files.” Search supports a relative path, glob, case and whole-word matching, optional regular expressions, and up to two lines of context. Git-ignored files, symbolic links, common credentials, and lockfiles are skipped. Hidden project configuration such as `.github/` is searchable. A bound Codex chat in a different folder retains its own working directory. Ask Codex to inspect that folder or review lengthy material.
@@ -131,7 +136,7 @@ With `rg.exe` on PATH, Gemini can search files, documents, code and configuratio
 | `Agent Not Found` | From your working folder, run `agy agents` and `agy mcp list` and look for `agydex` and `codex_bridge`. If you have yet to install globally, run `.\Install.ps1 -Global` from the bridge folder and start a fresh Antigravity process. |
 | PowerShell blocks the script from a ZIP | Confirm the ZIP came from this repository and review `Install.ps1`. In the bridge folder, run `Unblock-File -LiteralPath .\Install.ps1`, then run the installer. |
 | `Get-Command codex.exe` finds nothing, or `queue` is unavailable | Install or update the Windows Codex CLI using the official guide above, then check again in a new terminal. |
-| Codex finished but Antigravity is quiet | Say “Check the result” in the original conversation. If a new chat is waiting for the draft to be sent, send it in Codex App. If the task still appears to be running, check the app for a pending approval. |
+| Codex finished but Antigravity is quiet | Say “Check the result” in the original conversation. For a desktop draft, send it in Codex App. Approvals for direct turns appear in Antigravity. Approvals for desktop turns appear in Codex App. |
 | You're wondering whether to enable Codex hooks | Antigravity's background wait handles normal completion reports. You can disable existing `AGY Codex Bridge` hooks in Codex App. Project hooks can record acceptance and completion earlier, and the current version uses them to record manual interruptions. After a global install, run `.\Install.ps1 -Workspace 'C:\Work\MyProject' -HooksOnly` from the bridge folder, substituting your project path. This installs only the project hooks. Review and enable them in Codex App. If you set a custom `-StateDirectory`, use it here too. |
 
 ## License
