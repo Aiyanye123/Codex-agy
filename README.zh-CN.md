@@ -125,6 +125,10 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 
 如果 `rg.exe` 已加入 PATH，Gemini 可以只读查找文件、检索文档、代码与配置，或搜全部文本。例如「在 `src/` 的 `*.mjs` 文件里定位 `queueTask`」。检索支持相对路径、通配符、大小写、全词、正则和最多两行上下文。工具跳过 Git 忽略项、符号链接、常见凭据和锁文件，允许检索 `.github/` 等项目配置。绑定的 Codex 会话在另一个目录时，那个目录的核对及长材料审阅交给 Codex。
 
+用 `search_workspace` 的 `mode: "rich"` 在 `.docx`、`.xlsx` 和 `.pptx` 中搜索。`query` 必填，按字面匹配，可用 `path` 或 `glob` 缩小范围。要同时搜索 PDF、EPUB 或 ODT，可选装 ripgrep-all 及对应的文档适配器，再用 `Get-Command rga.exe` 确认命令在 PATH 中。缺少 `rga` 时仍可用内置解析器搜索现代 Office 文件。PATH 中有 `rg` 时，富文档检索会遵循忽略规则，改用目录扫描时会在结果中说明。[ripgrep-all](https://github.com/phiresky/ripgrep-all)
+
+用 `read_document` 指定工作区相对路径，可用紧凑 Markdown 读取 Word 标题、段落和表格、Excel 工作表，或 PowerPoint 正文和备注。Excel 默认列出工作表及表头预览，指定 `sheet` 读取单表，指定 `query` 在单表或整本工作簿中搜词。用 `start` 和 `limit` 按内容或命中项分页，拿 `next_start` 继续读。富文档检索和精读均跳过敏感路径、锁文件和链接，单文件上限为 20 MB。PDF 可用 `view_file`，旧版 `.doc`、`.xls`、`.ppt` 交给 Codex 读取。
+
 ## 完成通知、文件和本地数据
 
 - **等待与汇报。** 保持 Antigravity 对话打开，Gemini 会后台等待回执，每次最多一小时。收到回执后，Gemini 会对照原需求核对 Codex 的回执、追问遗漏，再用简体中文汇报。需要核对文档或明确提及的结果文件时，才按路径读取。常规且已授权的细节可以直接跟进。涉及范围变更、重要取舍或 Codex App 审批时，Gemini 会请你处理。退出 Antigravity 后，可恢复原对话并说「查结果」。
