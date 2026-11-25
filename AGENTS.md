@@ -8,6 +8,7 @@ This project connects Antigravity CLI to Codex on Windows. New chats open as dra
 - `src/mcp-entry.mjs` defines the MCP tools. `mcp.cjs` is the tracked bundle used by the installer.
 - `src/direct-run.mjs` owns the write connection for a direct turn, including approvals, steering, interruption, and shutdown.
 - `src/worktree.mjs` inspects linked Git worktrees and creates isolated checkouts for new chats.
+- `src/git-tools.mjs` implements bounded Git inspection and allowlisted writes for the Antigravity workspace.
 - `src/task-state.mjs` reconciles tasks with Codex history. `src/receipt.mjs` extracts replies and formats receipts.
 - `src/workspace-search.mjs` provides workspace search and applies the shared file restrictions for `rich` and `read_document`.
 - `src/office-doc.mjs` reads bounded ZIP and XML parts for Word blocks, Excel sheets and rows, and PowerPoint slides and notes.
@@ -27,6 +28,7 @@ This project connects Antigravity CLI to Codex on Windows. New chats open as dra
 - Never read, write, or migrate the live `.state\bridge.sqlite` directly during development or verification. Use a separate Git worktree for schema and hook changes so installed MCP commands and project hooks can keep using the active checkout.
 - Run `Install.ps1 -Global` only with explicit user authorization.
 - Preserve user worktrees and uncommitted changes. Leave worktree cleanup to the user, and move individual files to the Recycle Bin when deletion is authorized.
+- Launch the PATH Git executable from outside the worktree without a shell. Keep user pathspecs literal and workspace-relative, and check worktree traversal for Windows junctions before reading or updating files. Allow only fast-forward pulls and merges and single-branch, non-forced pushes. Wait for active bridge tasks in the same canonical worktree before allowing any Git write. Request explicit authorization for the destination branch before pushing.
 - Keep rich document access workspace-relative. Exclude sensitive paths, lockfiles and links, cap source files at 20 MB, and bound ZIP expansion and output. Find `rga` outside the workspace, use only the allowed document adapters, and keep its temporary configuration and empty cache outside the workspace.
 - Use `execution_mode: "direct"` to switch a slot to direct execution. Later tasks on that binding keep the mode until `execution_mode: "desktop"` or an automatic downgrade. Opening the direct chat in Codex App can take the write lock and trigger the downgrade on the next task.
 - Keep execution and history reads on separate connections. A direct turn keeps its slot and thread reserved until the writer exits. Queue once when resume returns an active-writer conflict before turn submission. Report that the queued turn uses the desktop chat's policy.

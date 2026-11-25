@@ -171,6 +171,8 @@ if (!$HooksOnly) {
             list_tasks = @{ eager = $true }
             search_workspace = @{ eager = $true }
             read_document = @{ eager = $true }
+            git_inspect = @{ eager = $true }
+            git_action = @{ eager = $true }
             recent_replies = @{ eager = $true }
             status = @{ eager = $true }
             watch = [ordered]@{ eager = $true; background = 'always' }

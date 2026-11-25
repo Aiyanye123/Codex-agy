@@ -80,7 +80,7 @@ function files(configRoot) {
   return { agent: path.join(configRoot, "agents/agydex/agent.md"), mcp: path.join(configRoot, "mcp_config.json") };
 }
 
-test("fresh global install in a disposable profile; repeating it does not rewrite settings", async () => {
+test("fresh global install in a disposable profile; repeating it does not rewrite settings", () => {
   const { agent, mcp } = files(path.join(env.USERPROFILE, ".gemini/config"));
   assert.match(install("", { global: true }), /agy --agent agydex\b/);
   assert.equal(readFileSync(agent, "utf8"), readFileSync(sourceAgent, "utf8"));
@@ -89,21 +89,7 @@ test("fresh global install in a disposable profile; repeating it does not rewrit
   assert.equal(server.args[2], ".");
   assert.equal(server.timeoutSeconds, 3700);
   assert.equal(server.tools.watch.background, "always");
-  const client = new Client({ name: "install-test", version: "1" });
-  const transport = new StdioClientTransport({ command: process.execPath,
-    args: ["--disable-warning=ExperimentalWarning", path.join(scratch, "mcp.cjs"), ".", ":memory:", "unused"],
-    cwd: scratch,
-  });
-  await client.connect(transport);
-  try {
-    const { tools, nextCursor } = await client.listTools();
-    assert.equal(nextCursor, undefined);
-    assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(server.tools).sort());
-    assert.ok(Object.values(server.tools).every(tool => tool.eager === true));
-    assert.equal(client.getInstructions(), "Use bridge tools directly.");
-    const properties = tools.find(tool => tool.name === "search_workspace").inputSchema.properties;
-    for (const key of ["query", "path", "glob"]) assert.doesNotMatch(properties[key].pattern, /\\u[\da-f]{4}/i);
-  } finally { await client.close(); }
+  assert.ok(Object.values(server.tools).every(tool => tool.eager === true));
   const receiptDir = path.join(scratch, "state/managed-agents");
   const paths = [agent, mcp, ...readdirSync(receiptDir).map(name => path.join(receiptDir, name))];
   assert.equal(paths.length, 3);
@@ -112,7 +98,7 @@ test("fresh global install in a disposable profile; repeating it does not rewrit
   assert.deepEqual(paths.map(file => statSync(file).mtimeMs), times);
 });
 
-test("legacy workspace installs agydex, preserves old roles, and upgrades only the bridge MCP settings", () => {
+test("legacy workspace installs agydex, preserves old roles, and upgrades only the bridge MCP settings", async () => {
   const workspace = path.join(scratch, "legacy");
   const configRoot = path.join(workspace, ".agents");
   const { agent, mcp } = files(configRoot);
@@ -142,9 +128,27 @@ test("legacy workspace installs agydex, preserves old roles, and upgrades only t
   assert.deepEqual(servers.codex_bridge.tools, { bind: { eager: true }, unbind: { eager: true },
     submit: { eager: true }, steer: { eager: true }, interrupt: { eager: true }, approve: { eager: true },
     resume_draft: { eager: true }, dismiss: { eager: true }, list_tasks: { eager: true },
-    search_workspace: { eager: true }, read_document: { eager: true }, recent_replies: { eager: true },
+    search_workspace: { eager: true }, read_document: { eager: true }, git_inspect: { eager: true }, git_action: { eager: true },
+    recent_replies: { eager: true },
     status: { eager: true }, watch: { eager: true, background: "always" } });
   assert.ok(existsSync(path.join(workspace, ".codex/hooks.json")));
+  const client = new Client({ name: "install-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: ["--disable-warning=ExperimentalWarning", path.join(scratch, "mcp.cjs"), ".", ":memory:", "unused"],
+    cwd: workspace,
+  });
+  await client.connect(transport);
+  try {
+    const { tools, nextCursor } = await client.listTools();
+    assert.equal(nextCursor, undefined);
+    assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(servers.codex_bridge.tools).sort());
+    assert.equal(client.getInstructions(), "Use bridge tools directly.");
+    const properties = tools.find(tool => tool.name === "search_workspace").inputSchema.properties;
+    for (const key of ["query", "path", "glob"]) assert.doesNotMatch(properties[key].pattern, /\\u[\da-f]{4}/i);
+    assert.deepEqual(tools.find(tool => tool.name === "git_inspect").annotations, { readOnlyHint: true, openWorldHint: false });
+    assert.deepEqual(tools.find(tool => tool.name === "git_action").annotations,
+      { readOnlyHint: false, destructiveHint: false, openWorldHint: true });
+  } finally { await client.close(); }
 });
 
 test("custom agent and unrelated same-name server both stop upgrades before writes", () => {
