@@ -8,7 +8,7 @@ antigravity-codex-bridge 在 Windows 本机连接 Antigravity CLI 和 Codex App�
 
 - Gemini 整理需求、派单、后台等回执，并按验收条件追补遗漏。默认只收摘要，节省对话上下文，需要时再取全文。
 - 可以在默认会话或多个命名子会话中新建、绑定 Codex 会话，独立任务可放在各自的 Git 工作树中并行推进。
-- 可选用 `rg` 在 Antigravity 当前工作区内做只读检索，跳过常见敏感文件。代码审阅和长材料交给 Codex。
+- Gemini 可用 Antigravity 原生终端查找证据、执行已获授权的日常 Git 操作。源码修改、代码审阅、构建测试和长材料交给 Codex。
 - 桥接在本机运行，无需常驻服务。绑定和工单记录保存在本地 SQLite，已完结工单的回执原文保留 30 天后自动清理。
 
 ## 安装
@@ -123,15 +123,13 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | 改用一个新会话 | 说「新开一个 Codex 会话处理」。Codex App 会先打开草稿，想立即派单时可要求使用直连。 |
 | 退出后恢复绑定 | 用 `/resume` 选回原来的 Antigravity 对话。也可以在同一目录运行 `agy --agent agydex -c` 恢复最近的对话，或用 `--conversation` 加对话 ID 精确恢复。 |
 
-如果 `rg.exe` 已加入 PATH，Gemini 可以只读查找文件、检索文档、代码与配置，或搜全部文本。例如「在 `src/` 的 `*.mjs` 文件里定位 `queueTask`」。检索支持相对路径、通配符、大小写、全词、正则和最多两行上下文。工具跳过 Git 忽略项、符号链接、常见凭据和锁文件，允许检索 `.github/` 等项目配置。绑定的 Codex 会话在另一个目录时，那个目录的核对及长材料审阅交给 Codex。
+### 终端与桥接工具
 
-用 `search_workspace` 的 `mode: "rich"` 在 `.docx`、`.xlsx` 和 `.pptx` 中搜索。`query` 必填，按字面匹配，可用 `path` 或 `glob` 缩小范围。要同时搜索 PDF、EPUB 或 ODT，可选装 ripgrep-all 及对应的文档适配器，再用 `Get-Command rga.exe` 确认命令在 PATH 中。缺少 `rga` 时仍可用内置解析器搜索现代 Office 文件。PATH 中有 `rg` 时，富文档检索会遵循忽略规则，改用目录扫描时会在结果中说明。[ripgrep-all](https://github.com/phiresky/ripgrep-all)
+`agydex` 通过 `commandExecutionPolicy: sandbox` 启用原生终端，实际运行遵循 Antigravity 的沙箱和权限设置。Gemini 可用内置查看和检索工具，也可在当前工作区通过终端做定向只读核查或已获授权的日常 Git 操作。命令需控制输出，跳过凭据、锁文件和符号链接。文本检索可选装 `rg`，文档检索可选装 `rga` 及所需适配器。用 `Get-Command rg.exe` 和 `Get-Command rga.exe` 检查 PATH。短篇 Office 文档也可用现成的只读解析工具查阅。[ripgrep-all](https://github.com/phiresky/ripgrep-all)
 
-用 `read_document` 指定工作区相对路径，可用紧凑 Markdown 读取 Word 标题、段落和表格、Excel 工作表，或 PowerPoint 正文和备注。Excel 默认列出工作表及表头预览，指定 `sheet` 读取单表，指定 `query` 在单表或整本工作簿中搜词。用 `start` 和 `limit` 按内容或命中项分页，拿 `next_start` 继续读。富文档检索和精读均跳过敏感路径、锁文件和链接，单文件上限为 20 MB。PDF 可用 `view_file`，旧版 `.doc`、`.xls`、`.ppt` 交给 Codex 读取。
+源码修改、代码审阅、构建测试、其他目录的核查和长材料处理均交给 Codex。Git 写入前，Gemini 必须确认同一工作树没有进行中的 Codex 工单。拉取和合并只允许快进，推送须获用户对目标分支的明确授权。禁止强推、`reset --hard`、`clean` 和改写历史。
 
-用 `git_inspect` 查看 Git 状态、差异、历史、单次提交、分支、工作树和储藏。文件过滤使用 Antigravity 工作区内的字面相对路径。遍历工作文件时，操作范围内的 Windows 符号链接和目录联接会触发拦截。只读输出最多 16 KiB、240 行，超出时会标记 `truncated`。
-
-用 `git_action` 执行已获授权的暂存、取消暂存、提交、新建或切换分支、抓取、快进拉取或合并、储藏或恢复，以及普通推送。暂存和取消暂存必须给出 `paths` 或显式传 `all: true`。切换分支、提交等操作作用于整个 Git 工作树和索引。同一工作树有未终结工单时会暂停写入，独立工作树可以并行。推送必须有用户对目标分支的明确授权，每次只更新该分支。工具不提供历史改写、强推或删除远端分支的命令。
+桥接的 12 个 MCP 工具负责会话和工单操作，包括 `bind`、`unbind`、`submit`、`status`、`list_tasks`、`recent_replies`、`dismiss`、`resume_draft`、`steer`、`interrupt`、`approve` 和 `watch`。
 
 ## 完成通知、文件和本地数据
 

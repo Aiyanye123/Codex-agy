@@ -114,7 +114,7 @@ test("legacy workspace installs agydex, preserves old roles, and upgrades only t
   writeJson(mcp, { mcpServers: { other: thirdParty, codex_bridge: {
     command: "C:\\old\\node.exe", args: ["--disable-warning=ExperimentalWarning", path.join(scratch, "mcp.cjs"),
       workspace, "old-state", "old-codex"], timeoutSeconds: 45, disabled: true,
-    tools: { obsolete: {}, watch: { eager: false } },
+    tools: { search_workspace: {}, read_document: {}, git_inspect: {}, git_action: {}, watch: { eager: false } },
   } } });
   assert.match(install(workspace), /Existing codex-agy agent files were preserved/);
   assert.equal(readFileSync(agent, "utf8"), readFileSync(sourceAgent, "utf8"));
@@ -128,7 +128,6 @@ test("legacy workspace installs agydex, preserves old roles, and upgrades only t
   assert.deepEqual(servers.codex_bridge.tools, { bind: { eager: true }, unbind: { eager: true },
     submit: { eager: true }, steer: { eager: true }, interrupt: { eager: true }, approve: { eager: true },
     resume_draft: { eager: true }, dismiss: { eager: true }, list_tasks: { eager: true },
-    search_workspace: { eager: true }, read_document: { eager: true }, git_inspect: { eager: true }, git_action: { eager: true },
     recent_replies: { eager: true },
     status: { eager: true }, watch: { eager: true, background: "always" } });
   assert.ok(existsSync(path.join(workspace, ".codex/hooks.json")));
@@ -143,11 +142,6 @@ test("legacy workspace installs agydex, preserves old roles, and upgrades only t
     assert.equal(nextCursor, undefined);
     assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(servers.codex_bridge.tools).sort());
     assert.equal(client.getInstructions(), "Use bridge tools directly.");
-    const properties = tools.find(tool => tool.name === "search_workspace").inputSchema.properties;
-    for (const key of ["query", "path", "glob"]) assert.doesNotMatch(properties[key].pattern, /\\u[\da-f]{4}/i);
-    assert.deepEqual(tools.find(tool => tool.name === "git_inspect").annotations, { readOnlyHint: true, openWorldHint: false });
-    assert.deepEqual(tools.find(tool => tool.name === "git_action").annotations,
-      { readOnlyHint: false, destructiveHint: false, openWorldHint: true });
   } finally { await client.close(); }
 });
 

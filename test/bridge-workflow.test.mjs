@@ -2,7 +2,7 @@ import { test, after, before } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -432,79 +432,52 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
   } finally { await client.close(); }
 });
 
-test("MCP workspace search returns bounded read-only matches from the current workspace", async () => {
-  const workspace = path.join(scratch, "search-workspace");
-  const outside = path.join(scratch, "outside-search-workspace");
+test("packaged MCP creates a worktree draft and binds a chat in the linked worktree", async () => {
+  const workspace = path.join(scratch, "worktree-project");
+  const statePath = path.join(scratch, "worktree.sqlite");
   mkdirSync(workspace);
-  mkdirSync(outside);
-  const files = {
-    "README.md": "Installation\nSearchNeedle --pre=bad & literal\n",
-    "settings.ps1": "# Setup\nSearchNeedle\n",
-    ".gitignore": "ignored.md\n",
-    ".ignore": "!.hidden.md\n",
-    ".hidden.md": "HiddenNeedle\n",
-    "ignored.md": "SearchNeedle\n",
-    ".env.local": "SearchNeedle\n",
-    "access.pem": "SearchNeedle\n",
-    "package-lock.json": "SearchNeedle\n",
-    "Dockerfile": "FROM alpine\nRUN echo SearchNeedle\n",
-    "rg.exe": "Workspace files must not be used as executables.\n",
-    "many.txt": `Bounded ${"x".repeat(1000)}\n`.repeat(25),
-  };
-  for (const [file, content] of Object.entries(files)) writeFileSync(path.join(workspace, file), content);
-  mkdirSync(path.join(workspace, ".github"));
-  writeFileSync(path.join(workspace, ".github", "pipeline.xml"), "start\nSearchNeedle\nend\n");
-  const outsideFile = path.join(outside, "outside.md");
-  const rgConfig = path.join(outside, "rg-config");
-  writeFileSync(outsideFile, "SearchNeedle\n");
-  writeFileSync(rgConfig, "--no-ignore\n--follow\n");
-  symlinkSync(outside, path.join(workspace, "outside-link"), "junction");
-  const before = readdirSync(workspace).sort();
-
-  const client = new Client({ name: "search-test", version: "1" });
-  const transport = new StdioClientTransport({ command: process.execPath,
-    args: [path.join(root, "mcp.cjs"), ".", ":memory:", "unused"], cwd: workspace,
-    env: { ...process.env, RIPGREP_CONFIG_PATH: rgConfig },
-  });
-  await client.connect(transport);
-  const call = async (args) => {
-    const response = await client.callTool({ name: "search_workspace", arguments: args });
-    assert.ok(!response.isError, JSON.stringify(response.content));
-    assert.equal(response.structuredContent, undefined);
-    return JSON.parse(response.content[0].text);
-  };
+  const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git(workspace, "init", "-b", "main");
+  writeFileSync(path.join(workspace, "tracked.txt"), "tracked");
+  git(workspace, "add", "--", "tracked.txt");
+  git(workspace, "-c", "core.hooksPath=NUL", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+    "commit", "--no-gpg-sign", "-m", "worktree fixture");
+  const base = git(workspace, "rev-parse", "HEAD");
+  writeFileSync(path.join(workspace, "tracked.txt"), "uncommitted");
+  const threadId = randomUUID();
+  const program = `
+    const core = require("./core.cjs");
+    const workspace = ${JSON.stringify(workspace)};
+    let draftWorkspace;
+    core.startDesktop = async uri => { draftWorkspace = new URL(uri).searchParams.get("path"); };
+    core.CodexReader = class { close() {} async read(method, { threadId }) {
+      if (method !== "thread/read" || !draftWorkspace) throw new Error("unexpected Codex read");
+      return { thread: { id: threadId, cwd: draftWorkspace } };
+    } };
+    process.argv = ["node", "mcp", workspace, ${JSON.stringify(statePath)}, "unused"];
+    require("./mcp.cjs");
+  `;
+  const client = new Client({ name: "worktree-test", version: "1" });
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root }));
+  async function call(name, args) {
+    const result = await client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": "owner" } });
+    assert.ok(!result.isError, JSON.stringify(result.content));
+    return result.structuredContent;
+  }
   try {
-    const listed = await call({ mode: "files", query: "readme" });
-    assert.deepEqual(listed.matches, [{ path: "README.md" }]);
-    const all = await call({ mode: "files" });
-    assert.ok(!all.matches.some(({ path }) => /ignored\.md|\.env\.local|access\.pem|package-lock|outside-link/.test(path)));
-    assert.ok(all.matches.some(({ path }) => path === ".github/pipeline.xml"));
-    assert.deepEqual((await call({ mode: "files", path: ".github", glob: "*.xml" })).matches, [{ path: ".github/pipeline.xml" }]);
-    assert.deepEqual((await call({ mode: "files", path: "ignored.md", glob: "*.md" })).matches, []);
-    const docs = await call({ mode: "docs", query: "searchneedle" });
-    assert.deepEqual(docs.matches, [{ path: "README.md", line: 2, text: "SearchNeedle --pre=bad & literal" }]);
-    assert.deepEqual((await call({ mode: "docs", query: "--pre=bad & literal" })).matches, docs.matches);
-    const code = await call({ mode: "code", query: "SearchNeedle" });
-    assert.deepEqual(code.matches.map(match => match.path).sort(), [".github/pipeline.xml", "Dockerfile", "settings.ps1"]);
-    const text = await call({ mode: "text", query: "SearchN[e]+dle", regex: true, whole_word: true,
-      case_sensitive: true, path: ".github", context_lines: 1 });
-    assert.deepEqual(text.matches, [{ path: ".github/pipeline.xml", line: 2, text: "SearchNeedle",
-      context: [{ line: 1, text: "start" }, { line: 3, text: "end" }] }]);
-    assert.deepEqual((await call({ mode: "docs", query: "searchneedle", case_sensitive: true })).matches, []);
-    const bounded = await call({ mode: "docs", query: "Bounded", limit: 4, per_file: 8 });
-    assert.equal(bounded.truncated, true);
-    assert.equal(bounded.matches.length, 4);
-    assert.equal((await call({ mode: "docs", query: "Bounded" })).matches.length, 3);
-    assert.ok(bounded.matches.every(({ text }) => text.length <= 302));
-    for (const args of [{ mode: "files", command: "write" }, { mode: "files", path: "../" },
-      { mode: "files", glob: "README\u0000.md" }, { mode: "docs", query: "a\nb" },
-      { mode: "files", path: outside }, { mode: "files", path: "outside-link" },
-      { mode: "docs", query: "(?=test)", regex: true }]) {
-      assert.equal((await client.callTool({ name: "search_workspace", arguments: args })).isError, true);
-    }
-    assert.deepEqual(readdirSync(workspace).sort(), before);
-    for (const [file, content] of Object.entries(files)) assert.equal(readFileSync(path.join(workspace, file), "utf8"), content);
-    assert.equal(readFileSync(outsideFile, "utf8"), "SearchNeedle\n");
+    const draft = await call("submit", { prompt: "worktree draft", worktree: true });
+    assert.equal(draft.state, "awaiting_send", draft.detail);
+    assert.equal(draft.worktree.repo_root, core.workspacePath(workspace));
+    assert.equal(draft.worktree.base_commit, base);
+    assert.equal(draft.worktree.branch, `agy/${draft.task_id}`);
+    assert.equal(git(draft.worktree.path, "branch", "--show-current"), draft.worktree.branch);
+    assert.equal(readFileSync(path.join(draft.worktree.path, "tracked.txt"), "utf8"), "tracked");
+    assert.equal(readFileSync(path.join(workspace, "tracked.txt"), "utf8"), "uncommitted");
+    const bound = await call("bind", { session: threadId });
+    assert.equal(bound.workspace, draft.worktree.path);
+    assert.deepEqual(bound.worktree, draft.worktree);
+    assert.equal((await call("unbind", {})).state, "unbound");
+    assert.ok(existsSync(draft.worktree.path));
   } finally { await client.close(); }
 });
 

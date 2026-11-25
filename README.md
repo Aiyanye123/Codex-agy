@@ -8,7 +8,7 @@ antigravity-codex-bridge connects Antigravity CLI and Codex App on your Windows 
 
 - Gemini prepares and dispatches tasks, waits in the background, checks results, and follows up on gaps. It receives a short receipt by default to save context and can fetch the full reply on request.
 - Open or bind Codex chats in a default session and any number of named sessions. Independent tasks can run in separate Git worktrees.
-- Optional read-only `rg` search stays within the current Antigravity workspace and skips common sensitive files. Codex handles code review and long materials.
+- Gemini can gather evidence and perform authorized routine Git operations with Antigravity's native terminal. Codex handles source edits, code review, builds, tests, and long materials.
 - The bridge runs locally without a persistent background service. It keeps bindings and task records in SQLite and clears stored reply text from finished tasks after 30 days.
 
 ## Installation
@@ -123,15 +123,13 @@ Project hooks are optional. To record worktree activity through hooks, run the h
 | Switch to a new chat | Say “Start a new Codex chat for this task.” This opens a draft in Codex App. Ask for direct mode to send immediately. |
 | Resume after exiting | Use `/resume` to select the original Antigravity conversation. In the same folder, `agy --agent agydex -c` resumes the most recent conversation. To pick a specific one by ID, use `--conversation` followed by the ID. |
 
-With `rg.exe` on PATH, Gemini can search files, documents, code and configuration, or all text in the current Antigravity workspace. Try “Find references to `queueTask` under `src/` in `*.mjs` files.” Search supports a relative path, glob, case and whole-word matching, optional regular expressions, and up to two lines of context. Git-ignored files, symbolic links, common credentials, and lockfiles are skipped. Hidden project configuration such as `.github/` is searchable. A bound Codex chat in a different folder retains its own working directory. Ask Codex to inspect that folder or review lengthy material.
+### Terminal and bridge tools
 
-Use `search_workspace` with `mode: "rich"` and a literal `query` for `.docx`, `.xlsx`, and `.pptx` files. Use `path` or `glob` to narrow the search. To search PDF, EPUB, or ODT as well, optionally install ripgrep-all with its document adapters and confirm it is on PATH with `Get-Command rga.exe`. The bridge can search modern Office files with its built-in reader when `rga` is unavailable. Rich search honors ignore files when `rg` is on PATH and reports when it uses a directory scan. [ripgrep-all](https://github.com/phiresky/ripgrep-all)
+The `agydex` agent enables Antigravity's terminal with `commandExecutionPolicy: sandbox`, subject to Antigravity's own sandbox and permissions. Its built-in tool list includes file viewing and search. Gemini limits commands to read-only checks in the Antigravity workspace and authorized routine Git operations. It skips credentials, lockfiles, and links, and limits output. For targeted checks, the terminal can use optional `rg` for text and `rga` for formats supported by its installed adapters. Check PATH with `Get-Command rg.exe` and `Get-Command rga.exe`. Short Office documents can also be read with an available read-only parser. [ripgrep-all](https://github.com/phiresky/ripgrep-all)
 
-Use `read_document` with a workspace-relative `path` to read Word headings, paragraphs and tables, Excel sheets, or PowerPoint slides and notes as compact Markdown. Excel first shows the sheet list and header previews. Pass `sheet` to read rows from one sheet, or `query` to search within that sheet or across the workbook. Use `start` and `limit` to page through items or matches, and use `next_start` to continue. Rich search and document reading skip sensitive paths, lockfiles and links and accept source files up to 20 MB. Use `view_file` for PDFs, or ask Codex to read older `.doc`, `.xls`, and `.ppt` files.
+Gemini delegates source edits, code review, builds, tests, work in other folders, and lengthy reviews to Codex. Before writing to Git, it checks whether a Codex task is active in the same worktree. Pulls and merges must be fast-forward, and pushes require explicit user authorization for the destination branch. Force pushes, `reset --hard`, `clean`, and history rewrites are prohibited.
 
-Use `git_inspect` to check status, diffs, history, a single commit, branches, worktrees, or stashes. File filters use literal paths relative to the Antigravity workspace. Operations that traverse working files reject Windows links and junctions in their scope. Inspection output is capped at 16 KiB and 240 lines, with a `truncated` flag.
-
-Use `git_action` for authorized staging, unstaging, commits, branch creation and switching, fetches, fast-forward pulls and merges, stash and pop, and ordinary pushes. Staging and unstaging require `paths` or `all: true`. Worktree operations such as switching branches and committing use the whole worktree and its index. Writes pause while an unfinished bridge task is using the same Git worktree. Pushes require explicit user authorization for the destination branch and can update only that branch. The tools exclude history rewrites, forced pushes, and remote branch deletion.
+The bridge's 12 MCP tools cover sessions and tasks through `bind`, `unbind`, `submit`, `status`, `list_tasks`, `recent_replies`, `dismiss`, `resume_draft`, `steer`, `interrupt`, `approve`, and `watch`.
 
 ## Completion, files, and local data
 

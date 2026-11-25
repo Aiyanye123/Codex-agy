@@ -9,8 +9,6 @@ import {
   assertNoDirectWriter, bindingStatus, clearExpiredReports, dismissTask, dispatchLeaseMs, listTasks, ongoing,
   readWithRetry, refreshTask, releaseAbandonedWriter, taskIdsForTurn, validateFollowUp, waitingForUser,
 } from "./task-state.mjs";
-import { readDocument, searchWorkspace } from "./workspace-search.mjs";
-import { actOnGit, gitInspectActions, gitWriteActions, inspectGit } from "./git-tools.mjs";
 import { excerpt, receiptInstruction, recentReplies, reportFields } from "./receipt.mjs";
 import { addWorktree, inspectWorktree, planWorktree } from "./worktree.mjs";
 import { DirectRun, desktopOwnsThread } from "./direct-run.mjs";
@@ -38,11 +36,6 @@ const completedWatchLimit = 1024;
 const codexTerminalStates = new Set(["reported", "no_report", "failed", "interrupted"]);
 const sessionNameParam = z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/).optional()
   .describe("目标子会话名。省略时使用 default。");
-const workspacePathParam = z.string().max(500).regex(/^[^\x00-\x1f\x7f]+$/u);
-const workspaceQueryParam = z.string().trim().max(120).regex(/^[^\x00-\x1f\x7f]*$/u);
-const gitPathsParam = z.array(workspacePathParam).min(1).max(40).optional()
-  .describe("Antigravity 工作区内的字面相对路径。");
-const gitNameParam = z.string().min(1).max(200).regex(/^[^\x00-\x1f\x7f]+$/u).optional();
 
 function conversationOwner(context) {
   const owner = context._meta?.["antigravity.google/root_conversation_id"];
@@ -523,70 +516,6 @@ server.registerTool("list_tasks", {
   for (const writer of writers) releaseAbandonedWriter(database, writer);
   return reply({ tasks: listTasks(database, owner, limit, sessionName), bindings: await bindingOverview(owner) });
 });
-
-server.registerTool("search_workspace", {
-  description: "只读检索 Antigravity 当前工作区。files 找路径，docs 查文档，code 定位代码和配置，text 搜全部文本，rich 按必填关键词搜 Office、PDF 等富文档。path 限定相对路径，glob 可过滤文件。默认按字面匹配。",
-  inputSchema: z.strictObject({
-    mode: z.enum(["files", "docs", "code", "text", "rich"]),
-    query: workspaceQueryParam.optional().describe("除 files 外必填。rich 使用字面关键词。"),
-    path: workspacePathParam.optional(),
-    glob: z.string().max(120).regex(/^[^\x00-\x1f\x7f]+$/u).optional(),
-    limit: z.number().int().min(1).max(100).optional(),
-    per_file: z.number().int().min(1).max(8).optional(),
-    case_sensitive: z.boolean().optional(),
-    whole_word: z.boolean().optional(),
-    regex: z.boolean().optional(),
-    context_lines: z.number().int().min(0).max(2).optional(),
-  }),
-  annotations: { readOnlyHint: true, openWorldHint: false },
-}, async (options, context) => textReply(await searchWorkspace(workspace, options, context.signal)));
-
-server.registerTool("read_document", {
-  description: "只读精读当前 Antigravity 工作区内的 .docx、.xlsx 或 .pptx，返回紧凑 Markdown。Excel 默认返回工作表概览和表头，指定 sheet 读单表，指定 query 搜一张或全部工作表。PDF 用 view_file 或 rich 搜索，旧版 Office 交给 Codex。",
-  inputSchema: z.strictObject({
-    path: workspacePathParam.describe("工作区内的相对文件路径。"),
-    sheet: z.string().min(1).max(120).regex(/^[^\x00-\x1f\x7f]+$/u).optional().describe("Excel 工作表的准确名称。"),
-    start: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional().describe("从 1 开始，续读使用 next_start。搜词时按命中项分页。"),
-    limit: z.number().int().min(1).max(100).optional().describe("每页最多返回的块、页、行或工作表数量。"),
-    query: workspaceQueryParam.min(1).optional().describe("字面关键词，默认忽略大小写。"),
-    case_sensitive: z.boolean().optional(),
-  }),
-  annotations: { readOnlyHint: true, openWorldHint: false },
-}, async options => textReply(readDocument(workspace, options)));
-
-server.registerTool("git_inspect", {
-  description: "只读查看当前工作区对应的 Git 工作树。status 看分支、上游和工作状态，diff 看差异，log 看历史，show 看指定提交，branches、worktrees、stash_list 分别列出分支、工作树和储藏。输出带 truncated 标记。",
-  inputSchema: z.strictObject({
-    action: z.enum(gitInspectActions),
-    staged: z.boolean().optional().describe("diff 查看暂存区。"),
-    stat: z.boolean().optional().describe("diff、log 或 show 附带文件统计。"),
-    base: gitNameParam.describe("diff 的基准提交。"),
-    target: gitNameParam.describe("与 base 比较的目标提交。"),
-    ref: gitNameParam.describe("log 或 show 的提交引用，默认 HEAD。"),
-    paths: gitPathsParam,
-    context_lines: z.number().int().min(0).max(5).optional(),
-    limit: z.number().int().min(1).max(30).optional().describe("log 的提交数，默认 10。"),
-  }),
-  annotations: { readOnlyHint: true, openWorldHint: false },
-}, async (options, context) => textReply(await inspectGit(workspace, options, context.signal)));
-
-server.registerTool("git_action", {
-  description: "在用户授权范围内操作当前 Git 工作树。暂存或取消暂存必须指定 paths 或 all: true。pull_ff 和 merge_ff 只允许快进。push 必须获用户对目标分支的明确授权。同一工作树有进行中工单时暂停写入。",
-  inputSchema: z.strictObject({
-    action: z.enum(gitWriteActions),
-    paths: gitPathsParam,
-    all: z.boolean().optional(),
-    message: z.string().max(4096).regex(/^[^\x00]*$/u).optional().describe("commit 的非空说明或 stash_push 的备注。"),
-    branch: gitNameParam.describe("分支名称。push 省略时使用当前分支。"),
-    start_point: gitNameParam.describe("create_branch 的起始提交。"),
-    remote: gitNameParam.describe("已配置的远程名称，fetch 和 push 默认 origin。"),
-    ref: gitNameParam.describe("merge_ff 的目标提交引用。"),
-    include_untracked: z.boolean().optional().describe("stash_push 同时储藏未跟踪文件。"),
-    stash_ref: z.string().max(32).regex(/^stash@\{\d+\}$/u).optional().describe("stash_pop 的储藏引用，默认 stash@{0}。"),
-    set_upstream: z.boolean().optional().describe("push 同时设置上游。"),
-  }),
-  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-}, async (options, context) => textReply(await actOnGit(workspace, database, options, context.signal)));
 
 server.registerTool("recent_replies", {
   description: "按需查看当前 Antigravity 对话已绑定的 Codex 会话中最近的最终回复，默认三条、最多六条；无需工单，不会续写会话。",
