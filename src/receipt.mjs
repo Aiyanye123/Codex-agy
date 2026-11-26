@@ -47,7 +47,7 @@ export async function recentReplies(reader, threadId, limit, signal) {
       if (!answer) continue;
       const user = turn.items.find(item => item.type === "userMessage")?.content
         ?.filter(item => item.type === "text").map(item => item.text).join("\n") ?? "";
-      const cleanUser = user.replace(/^\[AGY Codex task: [a-f0-9-]+\]\r?\n/i, "")
+      const cleanUser = user.replaceAll("\r\n", "\n").replace(/^\[AGY Codex task: [a-f0-9-]+\]\n/i, "")
         .replace(receiptInstruction, "").trim();
       const budgeted = summaryBlock(answer) || answer;
       replies.push({ turn_id: turn.id, user: excerpt(cleanUser, 240), reply: excerpt(budgeted, recentReplyLimit),

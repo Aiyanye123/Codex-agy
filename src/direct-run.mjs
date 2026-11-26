@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import core from "../core.cjs";
 import { finalMessage, excerpt } from "./receipt.mjs";
+
+const { childLifecycle } = core;
 
 const requestTypes = new Map([
   ["item/commandExecution/requestApproval", "command"],
@@ -20,7 +23,7 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-export function desktopOwnsThread(error) {
+export function threadHasActiveWriter(error) {
   return error.method === "thread/resume" && error.code === -32600 && /already has an active writer/i.test(error.message);
 }
 
@@ -34,22 +37,24 @@ export class DirectRun {
     this.tools = new Map();
     this.toolResults = [];
     this.final = null;
+    this.stderr = "";
     const args = ["app-server", "--listen", "stdio://"];
     if (process.platform === "win32" && ["read-only", "workspace-write"].includes(sandbox)) {
       args.push("-c", 'windows.sandbox="mxc"');
     }
     const child = spawn(codex, args, { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     this.child = child;
+    this.lifecycle = childLifecycle(child);
     this.done = new Promise(resolve => { this.resolveDone = resolve; });
-    this.exited = new Promise(resolve => child.once("close", (code, signal) => {
-      const reason = this.connectionError ?? new Error(`Codex 执行连接已关闭（${code ?? signal}）。`);
-      this.disconnect(reason);
-      resolve();
-    }));
+    void this.lifecycle.closed.then(result => {
+      this.disconnect(result?.error ?? new Error(`Codex 执行连接已关闭（${result?.code ?? result?.signal ?? "退出未确认"}）。`));
+    });
     child.once("error", error => this.disconnect(error));
     child.stdin.on("error", error => this.disconnect(error));
-    child.stderr.resume();
-    createInterface({ input: child.stdout }).on("line", line => {
+    child.stderr.setEncoding("utf8").on("data", chunk => {
+      this.stderr = (this.stderr + chunk).slice(-500);
+    });
+    createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", line => {
       try { this.receive(JSON.parse(line)); }
       catch (error) {
         this.disconnect(error);
@@ -59,12 +64,19 @@ export class DirectRun {
   }
 
   disconnect(error) {
-    this.connectionError ??= error;
+    if (this.connectionError) return;
+    this.connectionError = error;
     for (const { reject } of this.requests.values()) reject(error);
     this.requests.clear();
     if (this.completed) this.finish();
     else this.resolveDone({ error });
     for (const request of this.pending.values()) request.resolve(false);
+  }
+
+  describeFailure(message) {
+    const tail = this.stderr.trim();
+    const reason = excerpt(message, 500);
+    return tail ? `${reason} (stderr: ${tail})` : reason;
   }
 
   send(message) {
@@ -93,6 +105,7 @@ export class DirectRun {
     const response = threadId
       ? await this.request("thread/resume", { threadId, excludeTurns: true, ...config })
       : await this.request("thread/start", { cwd: this.cwd, ...config });
+    if (this.stopping) throw new Error("桥接正在关闭，未提交 Codex 回合。");
     this.threadId = response.thread?.id;
     if (!this.threadId || (threadId && this.threadId !== threadId)) throw new Error("Codex 返回了无效的执行线程。");
     onThread(this.threadId);
@@ -231,7 +244,12 @@ export class DirectRun {
     return this.request("turn/interrupt", { threadId: this.threadId, turnId: this.turnId });
   }
 
-  async stop() {
+  stop() {
+    return this.stopped ??= this.stopTurn();
+  }
+
+  async stopTurn() {
+    this.stopping = true;
     if (this.turnId && !this.completed && !this.closing && !this.connectionError) {
       try {
         await withTimeout(this.interrupt(), 500, "Codex 中断确认超时。");
@@ -240,17 +258,10 @@ export class DirectRun {
         // Shutdown still closes the connection when interruption cannot be confirmed.
       }
     }
-    await this.close(750);
+    return this.close(750);
   }
 
   close(grace = 1500) {
-    if (!this.closing) {
-      this.child.stdin.end();
-      this.closing = withTimeout(this.exited, grace, "Codex 执行进程未退出。").catch(async () => {
-        this.child.kill();
-        await this.exited;
-      });
-    }
-    return this.closing;
+    return this.closing ??= this.lifecycle.stop(grace);
   }
 }

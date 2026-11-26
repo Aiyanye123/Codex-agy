@@ -41,7 +41,16 @@ function workspacePath(value) {
 }
 
 function sameWorkspace(first, second) {
-  return first.toLowerCase() === second.toLowerCase();
+  try {
+    const left = workspacePath(first);
+    const right = workspacePath(second);
+    if (left === right) return true;
+    const a = statSync(left, { bigint: true });
+    const b = statSync(right, { bigint: true });
+    return a.isDirectory() && b.isDirectory() && a.ino > 0n && a.dev === b.dev && a.ino === b.ino;
+  } catch {
+    return false;
+  }
 }
 
 function openDatabase(path) {
@@ -154,8 +163,8 @@ function saveBinding(database, owner, sessionName, threadId, pendingTaskId, work
     worktree?.repo_root ?? null, worktree?.path ?? null, worktree?.branch ?? null, worktree?.base_commit ?? null, executionMode);
 }
 
-function bindThread(database, owner, threadId, sessionName = defaultSession, workspace = null, worktree = null) {
-  saveBinding(database, owner, sessionName, threadId, null, workspace, worktree);
+function bindThread(database, owner, threadId, sessionName = defaultSession, workspace = null, worktree = null, executionMode = "desktop") {
+  saveBinding(database, owner, sessionName, threadId, null, workspace, worktree, executionMode);
 }
 
 function bindingWorktree(binding) {
@@ -188,14 +197,57 @@ function recordResult(database, taskId, state, report, detail = null) {
   `).run(state, report, detail, taskId);
 }
 
-function startDesktop(uri) {
-  return run("powershell.exe", [
-    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-    "$ErrorActionPreference = 'Stop'; Start-Process -FilePath $env:AGY_CODEX_BRIDGE_URL",
-  ], {
-    env: { ...process.env, AGY_CODEX_BRIDGE_URL: uri },
-    windowsHide: true,
-    timeout: 10000,
+async function startDesktop(uri, { platform = process.platform, spawnProcess = spawn, env = process.env, timeout = 10000 } = {}) {
+  const directHint = '没有可用桌面时，可指定 execution_mode: "direct"。';
+  let command;
+  let args = [uri];
+  if (platform === "win32") {
+    command = "powershell.exe";
+    args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+      "$ErrorActionPreference = 'Stop'; Start-Process -FilePath $env:AGY_CODEX_BRIDGE_URL"];
+    env = { ...env, AGY_CODEX_BRIDGE_URL: uri };
+  } else if (platform === "darwin") {
+    command = "/usr/bin/open";
+  } else if (platform === "linux") {
+    command = "xdg-open";
+  } else {
+    throw new Error(`当前平台没有 Codex 桌面打开器。${directHint}`);
+  }
+
+  const failed = reason => new Error(`未打开 Codex 桌面草稿：${reason}。${directHint}`);
+  const launchError = error => failed(error.code === "ENOENT" ? `找不到 ${command}` : `无法启动 ${command}`);
+  let child;
+  try {
+    child = spawnProcess(command, args, { env, windowsHide: true, stdio: "ignore" });
+  } catch (error) {
+    throw launchError(error);
+  }
+  let timer;
+  const result = new Promise((resolve, reject) => {
+    child.once("error", error => reject(launchError(error)));
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+      } else if (signal) {
+        reject(unconfirmedDesktop(`打开器因 ${signal} 退出`));
+      } else if (platform === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
+        reject(failed("xdg-open 失败，当前进程可能没有可用图形会话"));
+      } else {
+        reject(failed(`${command} 返回 ${code}，请检查 Codex App 和 codex:// 协议关联`));
+      }
+    });
+    timer = setTimeout(() => {
+      // xdg-open can stay alive while the desktop application is already open.
+      child.unref();
+      reject(unconfirmedDesktop("打开器响应超时"));
+    }, timeout);
+  });
+  return result.finally(() => clearTimeout(timer));
+}
+
+function unconfirmedDesktop(reason) {
+  return Object.assign(new Error(`桌面草稿状态未确认：${reason}。请先在 Codex App 检查原草稿，避免重复发送。`), {
+    code: "DESKTOP_OPEN_UNCONFIRMED",
   });
 }
 
@@ -207,17 +259,79 @@ function queueTask(codex, workspace, threadId, prompt) {
   });
 }
 
+function waitForExit(exited, ms) {
+  let timer;
+  const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(false), ms); });
+  return Promise.race([exited, timeout]).finally(() => clearTimeout(timer));
+}
+
+function childLifecycle(child, platform = process.platform) {
+  let resolveExit, resolveClose, outcome, drainTimer, closing;
+  let pipesClosed = false;
+  const exited = new Promise(resolve => { resolveExit = resolve; });
+  const closed = new Promise(resolve => { resolveClose = resolve; });
+
+  const finish = () => {
+    pipesClosed = true;
+    clearTimeout(drainTimer);
+    resolveClose(outcome);
+  };
+  const closePipes = () => {
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+    finish();
+  };
+  const noteExit = result => {
+    if (outcome) return;
+    outcome = result;
+    resolveExit(true);
+    // Drain buffered JSONL after exit without waiting for inherited pipes indefinitely.
+    if (!pipesClosed) drainTimer = setTimeout(closePipes, 100);
+  };
+  child.once("exit", (code, signal) => noteExit({ code, signal }));
+  child.on("error", error => {
+    if (!child.pid) noteExit({ error });
+  });
+  child.once("close", (code, signal) => {
+    noteExit({ code, signal });
+    finish();
+  });
+
+  async function stop(grace) {
+    child.stdin.end();
+    if (!await waitForExit(exited, grace)) {
+      child.kill("SIGTERM");
+      if (!await waitForExit(exited, 500) && platform !== "win32") {
+        child.kill("SIGKILL");
+        await waitForExit(exited, 500);
+      }
+    }
+    if (!outcome) {
+      child.unref();
+      closePipes();
+    }
+    await closed;
+    return Boolean(outcome);
+  }
+  return { closed, stop: grace => closing ??= stop(grace) };
+}
+
 class CodexReader {
   constructor(codex, spawnProcess = spawn) {
     this.codex = codex;
     this.spawnProcess = spawnProcess;
     this.nextId = 1;
     this.pending = new Map();
+    this.retiring = new Set();
   }
 
   async read(method, params) {
+    if (this.closed) throw new Error("Codex 历史读取连接已关闭。");
     if (!this.server) this.start();
+    const server = this.server;
     await this.ready;
+    if (this.server !== server) throw new Error("Codex 历史读取进程已断开。");
     return this.request(method, params);
   }
 
@@ -227,6 +341,7 @@ class CodexReader {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.server = server;
+    const lifecycle = childLifecycle(server);
     let stderr = "";
     server.stderr.setEncoding("utf8").on("data", (chunk) => { stderr = (stderr + chunk).slice(-1000); });
     const diagnostic = (error) => stderr.trim() ? new Error(`${error.message} (stderr: ${stderr.trim()})`) : error;
@@ -236,12 +351,18 @@ class CodexReader {
       this.ready = null;
       for (const pending of this.pending.values()) pending.reject(diagnostic(error));
       this.pending.clear();
-      server.kill();
+      const cleanup = lifecycle.stop(500);
+      this.retiring.add(cleanup);
+      void cleanup.then(exited => {
+        this.retiring.delete(cleanup);
+        if (!exited) process.stderr.write("AGY Codex Bridge: 无法确认历史读取进程已退出。\n");
+      });
     };
     server.on("error", fail);
     server.stdin.on("error", fail);
-    server.on("close", (code, signal) => fail(new Error(`Codex 历史读取进程已退出（${code ?? signal}）。`)));
-    createInterface({ input: server.stdout }).on("line", (line) => {
+    void lifecycle.closed.then(result => fail(result?.error ?? new Error(`Codex 历史读取进程已退出（${result?.code ?? result?.signal ?? "未知"}）。`)));
+    createInterface({ input: server.stdout, crlfDelay: Infinity }).on("line", (line) => {
+      if (this.server !== server) return;
       try {
         const message = JSON.parse(line);
         const pending = this.pending.get(message.id);
@@ -282,11 +403,13 @@ class CodexReader {
   }
 
   close() {
-    this.server?.kill();
+    this.closed = true;
+    this.fail?.(new Error("Codex 历史读取连接已关闭。"));
+    return Promise.all(this.retiring);
   }
 }
 
 module.exports = {
-  bindingWorktree, bindThread, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask, recordResult, saveBinding,
+  bindingWorktree, bindThread, childLifecycle, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask, recordResult, saveBinding,
   sameWorkspace, startDesktop, taskMarker, threadIdFrom, transaction, workspacePath,
 };

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import core from "../core.cjs";
 
@@ -16,7 +17,9 @@ async function git(cwd, args) {
 async function repository(directory) {
   let root;
   try {
-    root = workspacePath((await git(directory, ["rev-parse", "--show-toplevel"])).trimEnd());
+    const top = await git(directory, ["rev-parse", "--show-toplevel"]);
+    const newline = process.platform === "win32" && top.endsWith("\r\n") ? "\r\n" : "\n";
+    root = workspacePath(top.endsWith(newline) ? top.slice(0, -newline.length) : top);
   } catch (error) {
     if (/not a git repository/i.test(error.stderr ?? "")) return null;
     throw error;
@@ -40,7 +43,7 @@ export async function inspectWorktree(directory) {
   try {
     const repo = await repository(directory);
     if (!repo || sameWorkspace(repo.root, repo.repoRoot)) return null;
-    const tree = repo.trees.find(tree => relative(tree.path, repo.root) === "");
+    const tree = repo.trees.find(tree => sameWorkspace(tree.path, repo.root));
     if (!tree) throw new Error("Git 未列出当前工作树。");
     return { repo_root: repo.repoRoot, path: repo.root, branch: tree.branch, base_commit: null };
   } catch (error) {
@@ -53,11 +56,19 @@ export async function planWorktree(directory, id) {
   try {
     const repo = await repository(directory);
     if (!repo) throw new Error("当前工作目录不在 Git 仓库中。");
-    const path = join(dirname(repo.repoRoot), `${basename(repo.repoRoot).slice(0, 40)}-agy-${id}`);
-    if (repo.trees.some(tree => {
-      const location = relative(tree.path, path);
-      return location === "" || (!isAbsolute(location) && location !== ".." && !location.startsWith(`..${sep}`));
-    })) throw new Error("找不到仓库工作树之外的同级位置。");
+    const parent = workspacePath(dirname(repo.repoRoot));
+    const path = join(parent, `${basename(repo.repoRoot).slice(0, 40)}-agy-${id}`);
+    const candidate = lstatSync(path, { throwIfNoEntry: false });
+    if (candidate && !candidate.isDirectory()) throw new Error("工作树目标已存在且不是普通目录。");
+    const destination = candidate ? workspacePath(path) : path;
+    const insideWorktree = repo.trees.some(tree => {
+      const root = existsSync(tree.path) ? realpathSync.native(tree.path) : resolve(tree.path);
+      const offset = relative(root, destination);
+      return offset !== ".." && !offset.startsWith(`..${sep}`) && !isAbsolute(offset);
+    });
+    if (insideWorktree) {
+      throw new Error("找不到仓库工作树之外的同级位置。");
+    }
     const baseCommit = (await git(repo.root, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
     return { repo_root: repo.repoRoot, path, branch: `agy/${id}`, base_commit: baseCommit };
   } catch (error) {

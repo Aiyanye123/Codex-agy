@@ -2,29 +2,118 @@ import { test, after, before } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import core from "../core.cjs";
+import { receiptInstruction } from "../src/receipt.mjs";
 import { bindingStatus, dismissTask, listTasks, readWithRetry, refreshTask } from "../src/task-state.mjs";
+import { planWorktree } from "../src/worktree.mjs";
 
 const root = core.workspacePath(fileURLToPath(new URL("../", import.meta.url)));
-const scratchRoot = path.join(root, ".state");
+const scratchRoot = core.workspacePath(tmpdir());
 let scratch;
 
-before(() => {
-  mkdirSync(scratchRoot, { recursive: true });
-  scratch = mkdtempSync(path.join(scratchRoot, "bridge-test-"));
-});
+before(() => { scratch = mkdtempSync(path.join(scratchRoot, "bridge-test-")); });
 after(() => {
   if (!scratch) return;
   assert.equal(path.dirname(scratch), scratchRoot);
+  assert.ok(path.basename(scratch).startsWith("bridge-test-"));
   execFileSync("pwsh", ["-NoProfile", "-Command",
     "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:BRIDGE_TEST_DIR,'OnlyErrorDialogs','SendToRecycleBin')"],
     { env: { ...process.env, BRIDGE_TEST_DIR: scratch } });
+});
+
+const privateDraftUri = "codex://threads/new?path=%2Fworkspace&prompt=private-draft-body";
+
+test("desktop openers receive one URI and return safe, actionable failure details", async () => {
+  for (const [platform, expected] of [["win32", "powershell.exe"], ["darwin", "/usr/bin/open"], ["linux", "xdg-open"]]) {
+    await core.startDesktop(privateDraftUri, { platform, env: {}, spawnProcess(command, args, options) {
+      assert.equal(command, expected);
+      assert.equal(options.stdio, "ignore");
+      if (platform === "win32") {
+        assert.equal(options.env.AGY_CODEX_BRIDGE_URL, privateDraftUri);
+        assert.match(args.at(-1), /Start-Process -FilePath \$env:AGY_CODEX_BRIDGE_URL/);
+        assert.ok(!args.join(" ").includes(privateDraftUri));
+      } else {
+        assert.deepEqual(args, [privateDraftUri]);
+      }
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit("exit", 0, null));
+      return child;
+    } });
+  }
+  const failure = (event, args) => () => {
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit(event, ...args));
+    return child;
+  };
+  const missing = Object.assign(new Error(privateDraftUri), { code: "ENOENT" });
+  await assert.rejects(core.startDesktop(privateDraftUri, { platform: "linux", env: {}, spawnProcess: failure("error", [missing]) }),
+    error => /找不到 xdg-open.*execution_mode: "direct"/.test(error.message) && !error.message.includes("private-draft-body"));
+  await assert.rejects(core.startDesktop(privateDraftUri, { platform: "linux", env: {}, spawnProcess: failure("exit", [4, null]) }),
+    /图形会话.*execution_mode: "direct"/);
+  const child = new EventEmitter();
+  let unreferenced = false;
+  child.unref = () => { unreferenced = true; };
+  await assert.rejects(core.startDesktop(privateDraftUri, { platform: "linux", timeout: 5, spawnProcess: () => child }),
+    error => error.code === "DESKTOP_OPEN_UNCONFIRMED" && !error.message.includes("private-draft-body"));
+  assert.equal(unreferenced, true);
+});
+
+test("child cleanup uses stdin, SIGTERM and SIGKILL without waiting on inherited pipes", async () => {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const signals = [];
+  child.kill = signal => {
+    assert.equal(child.stdin.writableEnded, true);
+    signals.push(signal);
+    if (signal === "SIGKILL") child.emit("exit", null, signal);
+  };
+  const lifecycle = core.childLifecycle(child, "linux");
+  const cleanup = lifecycle.stop(5);
+  assert.equal(lifecycle.stop(5), cleanup);
+  assert.equal(await cleanup, true);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.deepEqual(await lifecycle.closed, { code: null, signal: "SIGKILL" });
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+});
+
+test("workspace identity accepts real directory aliases and rejects missing paths and files", () => {
+  const first = path.join(scratch, "CaseFolder");
+  const folded = path.join(scratch, "casefolder");
+  const alias = path.join(scratch, "workspace-alias");
+  const missing = path.join(scratch, "workspace-missing");
+  const file = path.join(scratch, "workspace-file");
+  mkdirSync(first);
+  const caseSensitive = !existsSync(folded);
+  if (caseSensitive) mkdirSync(folded);
+  symlinkSync(first, alias, process.platform === "win32" ? "junction" : "dir");
+  writeFileSync(file, "file");
+  assert.equal(core.sameWorkspace(first, alias), true);
+  assert.equal(core.sameWorkspace(first, folded), !caseSensitive);
+  assert.equal(core.sameWorkspace(first, missing), false);
+  assert.equal(core.sameWorkspace(missing, missing), false);
+  assert.equal(core.sameWorkspace(file, file), false);
+});
+
+test("packaged MCP rejects an unknown default mode before opening the state file", () => {
+  const statePath = path.join(scratch, "invalid-mode.sqlite");
+  const result = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning", "mcp.cjs",
+    scratch, statePath, "unused", "invalid"], { cwd: root, encoding: "utf8" });
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /\[desktop\|direct\]/);
+  assert.equal(existsSync(statePath), false);
 });
 
 function insertTask(db, state, owner = "owner", thread = null) {
@@ -266,12 +355,14 @@ test("failed initialize is discarded and next call starts a fresh reader with bo
     assert.equal(reader.server, null);
     assert.deepEqual(await reader.read("thread/read", {}), { ok: true });
     assert.equal(starts, 2);
-  } finally { reader.close(); }
+  } finally { await reader.close(); }
 });
 
 test("MCP submit, resume, list, dismiss and watch use the original draft without another dispatch", async () => {
   const program = `
     const core = require("./core.cjs");
+    const { EventEmitter } = require("node:events");
+    const startDesktop = core.startDesktop;
     const seen = new Map();
     core.startDesktop = async uri => {
       const msg = new URL(uri).searchParams.get("prompt");
@@ -279,6 +370,17 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
       if (msg.includes("original") && !msg.includes("AGY_SUMMARY_BEGIN")) throw new Error("missing receipt instruction");
       if (uri.length > 8000) throw new Error("oversized draft");
       if (seen.has(id) && seen.get(id) !== uri) throw new Error("different draft");
+      if (msg.includes("missing opener") || (msg.includes("slow opener") && !seen.has(id))) {
+        seen.set(id, uri);
+        return startDesktop(uri, { platform: "linux", env: {}, timeout: 5, spawnProcess() {
+          const opener = new EventEmitter();
+          opener.unref = () => {};
+          if (msg.includes("missing opener")) {
+            queueMicrotask(() => opener.emit("error", Object.assign(new Error(uri), { code: "ENOENT" })));
+          }
+          return opener;
+        } });
+      }
       seen.set(id, uri);
     };
     let polls = 0;
@@ -287,7 +389,7 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
       return {data:[]};
     } };
     process.argv = ["node","mcp",process.cwd(),":memory:","unused"];
-    import("./src/mcp-entry.mjs");
+    require("./mcp.cjs");
   `;
   const client = new Client({ name: "bridge-test", version: "1" });
   const transport = new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root });
@@ -326,6 +428,21 @@ test("MCP submit, resume, list, dismiss and watch use the original draft without
     const nearLimit = await call("submit", { prompt: "x".repeat(7800), new_chat: true });
     assert.equal(nearLimit.execution_mode, "desktop");
     assert.equal(nearLimit.state, "awaiting_send");
+
+    const failed = await call("submit", { prompt: "missing opener", new_chat: true });
+    assert.equal(failed.state, "dispatch_failed");
+    assert.equal(failed.new_task_dispatched, false);
+    assert.match(failed.detail, /找不到 xdg-open.*execution_mode: "direct"/);
+    assert.doesNotMatch(failed.detail, /missing opener/);
+    assert.equal((await call("list_tasks", {})).bindings[0].pending_task_id, nearLimit.task_id);
+
+    const slow = await call("submit", { prompt: "slow opener", new_chat: true });
+    assert.equal(slow.state, "dispatch_unknown");
+    assert.match(slow.detail, /超时.*原草稿/);
+    assert.equal((await call("submit", { prompt: "try again" })).task_id, slow.task_id);
+    const recovered = await call("resume_draft", { task_id: slow.task_id });
+    assert.equal(recovered.task_id, slow.task_id);
+    assert.equal(recovered.state, "awaiting_send");
   } finally { await client.close(); }
 });
 
@@ -340,23 +457,39 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
   const codex = `
     const threads = ${JSON.stringify(threads)};
     const send = value => console.log(JSON.stringify(value));
+    let heldTurn;
     require("node:readline").createInterface({ input: process.stdin }).on("line", line => {
       const { id, method, params } = JSON.parse(line);
       if (method === "initialized") return;
       if (method === "initialize") return send({ id, result: {} });
+      if (method === "thread/start" || method === "thread/resume") {
+        const expectedMxc = process.platform === "win32" && ["read-only", "workspace-write"].includes(params.sandbox);
+        if (process.argv.includes('windows.sandbox="mxc"') !== expectedMxc) throw new Error("unexpected MXC override");
+      }
       if (method === "thread/start") return send({ id, result: { thread: { id: threads.active } } });
       if (method === "thread/resume") {
         const threadId = params.threadId;
         if (threadId === threads.locked || threadId === threads.missing) {
           const message = threadId === threads.locked ? "thread already has an active writer" : "no rollout found for thread id " + threadId;
+          if (threadId === threads.missing) {
+            process.stderr.write("x".repeat(5000) + "\\nTAIL sandbox setup failed\\n", () =>
+              setTimeout(() => send({ id, error: { code: -32600, message } }), 30));
+            return;
+          }
           return send({ id, error: { code: -32600, message } });
         }
         return send({ id, result: { thread: { id: threadId } } });
+      }
+      if (method === "turn/interrupt" && params.turnId === heldTurn?.id) {
+        send({ id, result: {} });
+        send({ method: "turn/completed", params: { threadId: params.threadId, turn: { ...heldTurn, status: "interrupted" } } });
+        return;
       }
       if (method !== "turn/start") throw new Error("unexpected RPC " + method);
       const turn = { id: require("node:crypto").randomUUID(), status: "completed" };
       send({ method: "turn/started", params: { threadId: params.threadId, turn } });
       send({ id, result: { turn } });
+      if (params.input[0].text.includes("hold for shutdown")) { heldTurn = turn; return; }
       send({ method: "turn/completed", params: { threadId: params.threadId, turn } });
     });
   `;
@@ -365,7 +498,7 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
     const { spawn } = childProcess;
     childProcess.spawn = (exe, args, options) => {
       if (exe !== "mock-codex" || args[0] !== "app-server") throw new Error("unexpected process");
-      return spawn(process.execPath, ["-e", ${JSON.stringify(codex)}], options);
+      return spawn(process.execPath, ["-e", ${JSON.stringify(codex)}, "--", ...args.slice(3)], options);
     };
     const core = require("./core.cjs");
     const threads = ${JSON.stringify(threads)};
@@ -377,16 +510,22 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
       }
       return { thread: { id: threadId, cwd: workspace } };
     } };
-    core.queueTask = async (_, cwd, id) => {
+    core.queueTask = async (_, cwd, id, prompt) => {
       if (cwd !== workspace || (id !== threads.active && id !== threads.locked)) throw new Error("unexpected queue target");
+      if (prompt.includes("queue warning")) {
+        throw Object.assign(new Error("queue failed"), { stderr: "queue warning codex://threads/new?prompt=private-draft-body" });
+      }
     };
     core.startDesktop = async () => {};
-    process.argv = ["node", "mcp", workspace, ${JSON.stringify(statePath)}, "mock-codex"];
+    process.argv = ["node", "mcp", workspace, ${JSON.stringify(statePath)}, "mock-codex", ...process.argv.slice(1)];
     require("./mcp.cjs");
   `;
-  const client = new Client({ name: "submit-modes-test", version: "1" });
-  const transport = new StdioClientTransport({ command: process.execPath, args: ["-e", program], cwd: root });
-  await client.connect(transport);
+  let client;
+  async function connect(...args) {
+    client = new Client({ name: "submit-modes-test", version: "1" });
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: ["-e", program, ...args], cwd: root }));
+  }
+  await connect();
   const invoke = (name, args) => client.callTool({ name, arguments: args, _meta: { "antigravity.google/root_conversation_id": "owner" } });
   const call = async (name, args) => {
     const response = await invoke(name, args);
@@ -395,19 +534,24 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
   };
   const submit = (session_name, options) => call("submit", { prompt: "task", session_name, ...options });
   const direct = { execution_mode: "direct" };
-  async function verifyDirect(session_name, options) {
+  async function verifyDirect(session_name, options, expectedThread = threads[session_name]) {
     const task = await submit(session_name, options);
     assert.equal(task.execution_mode, "direct");
-    assert.equal(task.thread_id, threads[session_name]);
+    assert.equal(task.thread_id, expectedThread);
     assert.equal((await call("watch", { session_name, task_id: task.task_id })).state, "no_report");
   }
 
+  let liveTask;
   try {
     await verifyDirect("active", direct);
     await verifyDirect("active");
     const switched = await submit("active", { execution_mode: "desktop" });
     assert.equal(switched.state, "queued");
     assert.equal((await submit("active")).execution_mode, "desktop");
+    const uncertain = await submit("active", { prompt: "queue warning" });
+    assert.equal(uncertain.state, "dispatch_unknown");
+    assert.match(uncertain.detail, /queue warning/);
+    assert.doesNotMatch(uncertain.detail, /private-draft-body/);
 
     const rejected = await invoke("submit", { session_name: "recoverable", prompt: "desktop task" });
     assert.equal(rejected.isError, true);
@@ -421,6 +565,17 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
     const missing = await submit("missing", direct);
     assert.equal(missing.state, "dispatch_failed");
     assert.match(missing.detail, /thread\/resume.*no rollout found/);
+    assert.match(missing.detail, /TAIL sandbox setup failed\)$/);
+    assert.ok(missing.detail.length < 600);
+
+    for (const overrides of [{ sandbox: "workspace-write" }, { approval_policy: "never" }]) {
+      const protectedTask = await submit("locked", overrides);
+      assert.equal(protectedTask.state, "dispatch_failed");
+      assert.equal(protectedTask.execution_mode, "direct");
+      assert.equal(protectedTask.desktop_fallback, false);
+      assert.match(protectedTask.detail, /已有写入者.*未入队.*execution_mode: "desktop"/);
+      assert.equal((await call("list_tasks", { session_name: "locked" })).bindings.find(item => item.session_name === "locked").execution_mode, "direct");
+    }
 
     const fallback = await submit("locked");
     assert.equal(fallback.state, "queued");
@@ -429,21 +584,48 @@ test("MCP submit keeps direct bindings and handles unreadable or desktop-owned t
     const afterFallback = await submit("locked");
     assert.equal(afterFallback.state, "queued");
     assert.equal(afterFallback.desktop_fallback, false);
+
+    await client.close();
+    await connect("direct");
+    const noTask = await call("status", { session_name: "cli" });
+    assert.equal(noTask.state, "no_task");
+    assert.equal(noTask.execution_mode, "direct");
+    const first = await submit("cli");
+    assert.equal(first.execution_mode, "direct");
+    assert.equal((await call("watch", { task_id: first.task_id })).state, "no_report");
+    const bound = await call("bind", { session: threads.active, session_name: "bound-cli" });
+    assert.equal(bound.execution_mode, "direct");
+    await verifyDirect("bound-cli", {}, threads.active);
+    const newDirect = await submit("active", { new_chat: true });
+    assert.equal(newDirect.execution_mode, "direct");
+    assert.equal((await call("watch", { task_id: newDirect.task_id })).state, "no_report");
+    liveTask = await submit("cli", { prompt: "hold for shutdown" });
+    assert.equal(liveTask.state, "running");
   } finally { await client.close(); }
+  const shutdownDb = core.openDatabase(statePath);
+  try {
+    const task = shutdownDb.prepare("SELECT state, writer_pid FROM tasks WHERE id = ?").get(liveTask.task_id);
+    assert.equal(task.state, "interrupted");
+    assert.equal(task.writer_pid, null);
+  } finally { shutdownDb.close(); }
 });
 
 test("packaged MCP creates a worktree draft and binds a chat in the linked worktree", async () => {
-  const workspace = path.join(scratch, "worktree-project");
+  const workspace = path.join(scratch, process.platform === "win32" ? "worktree-project" : "worktree-project ");
   const statePath = path.join(scratch, "worktree.sqlite");
   mkdirSync(workspace);
   const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   git(workspace, "init", "-b", "main");
   writeFileSync(path.join(workspace, "tracked.txt"), "tracked");
   git(workspace, "add", "--", "tracked.txt");
-  git(workspace, "-c", "core.hooksPath=NUL", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+  const noHooks = process.platform === "win32" ? "NUL" : "/dev/null";
+  git(workspace, "-c", `core.hooksPath=${noHooks}`, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
     "commit", "--no-gpg-sign", "-m", "worktree fixture");
   const base = git(workspace, "rev-parse", "HEAD");
   writeFileSync(path.join(workspace, "tracked.txt"), "uncommitted");
+  const blocked = await planWorktree(workspace, "blocked-target");
+  symlinkSync(workspace, blocked.path, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(planWorktree(workspace, "blocked-target"), /工作树目标已存在/);
   const threadId = randomUUID();
   const program = `
     const core = require("./core.cjs");
@@ -470,6 +652,7 @@ test("packaged MCP creates a worktree draft and binds a chat in the linked workt
     assert.equal(draft.worktree.repo_root, core.workspacePath(workspace));
     assert.equal(draft.worktree.base_commit, base);
     assert.equal(draft.worktree.branch, `agy/${draft.task_id}`);
+    await assert.rejects(planWorktree(workspace, draft.task_id), /工作树之外/);
     assert.equal(git(draft.worktree.path, "branch", "--show-current"), draft.worktree.branch);
     assert.equal(readFileSync(path.join(draft.worktree.path, "tracked.txt"), "utf8"), "tracked");
     assert.equal(readFileSync(path.join(workspace, "tracked.txt"), "utf8"), "uncommitted");
@@ -487,6 +670,7 @@ test("MCP status and watch keep receipts compact and recent replies stay inside 
   const thread = randomUUID();
   const otherThread = randomUUID();
   const summary = "已完成设置更新。\n验证通过。\n待用户确认：无。";
+  const markedPrompt = `[AGY Codex task: ${randomUUID()}]\n\nOriginal question${receiptInstruction}`.replaceAll("\n", "\r\n");
   const report = `AGY_SUMMARY_BEGIN\n${summary}\nAGY_SUMMARY_END\n${"details ".repeat(300)}`;
   const oldReport = `结果 ${"old ".repeat(600)} 末尾验证`;
   const task = insertTask(db, "reported", "task-owner", thread);
@@ -507,7 +691,8 @@ test("MCP status and watch keep receipts compact and recent replies stay inside 
         { id:"newest", status:"completed", items:[{type:"userMessage",content:[{type:"text",text:"question ".repeat(100)}]},
           {type:"commandExecution",text:"private log"},{type:"agentMessage",phase:"commentary",text:"private commentary"},
           {type:"agentMessage",phase:"final_answer",text:"answer ".repeat(200)}]},
-        { id:"older", status:"completed", items:[{type:"agentMessage",phase:"final_answer",text:${JSON.stringify(report)}}]},
+        { id:"older", status:"completed", items:[{type:"userMessage",content:[{type:"text",text:${JSON.stringify(markedPrompt)}}]},
+          {type:"agentMessage",phase:"final_answer",text:${JSON.stringify(report)}}]},
         { id:"at-limit", status:"completed", items:[{type:"agentMessage",phase:"final_answer",text:"x".repeat(1200)}]},
       ] };
     } };
@@ -545,6 +730,7 @@ test("MCP status and watch keep receipts compact and recent replies stay inside 
     assert.equal(history.replies[0].reply.length, 1200);
     assert.equal(history.replies[0].reply_truncated, true);
     assert.equal(history.replies[1].reply, summary);
+    assert.equal(history.replies[1].user, "Original question");
     assert.equal(history.replies[1].reply_is_summary, true);
     assert.equal(history.replies[2].reply.length, 1200);
     assert.equal(history.replies[2].reply_truncated, false);

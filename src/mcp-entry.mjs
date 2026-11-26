@@ -11,13 +11,16 @@ import {
 } from "./task-state.mjs";
 import { excerpt, receiptInstruction, recentReplies, reportFields } from "./receipt.mjs";
 import { addWorktree, inspectWorktree, planWorktree } from "./worktree.mjs";
-import { DirectRun, desktopOwnsThread } from "./direct-run.mjs";
+import { DirectRun, threadHasActiveWriter } from "./direct-run.mjs";
 
 const {
   bindingWorktree, bindThread, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask,
   sameWorkspace, saveBinding, startDesktop, threadIdFrom, transaction, workspacePath,
 } = core;
-const [, , directory, statePath, codex] = process.argv;
+const [, , directory, statePath, codex, defaultMode = "desktop", ...extraArgs] = process.argv;
+if (!["desktop", "direct"].includes(defaultMode) || extraArgs.length) {
+  throw new Error("Usage: node mcp.cjs <workspace> <state-db> <codex> [desktop|direct]");
+}
 const workspace = workspacePath(directory);
 const database = openDatabase(statePath);
 clearExpiredReports(database);
@@ -27,10 +30,12 @@ const server = new McpServer({ name: "agy-codex-bridge", version: "0.1.0" }, {
 });
 const watching = new Set();
 const activeDispatches = new Set();
+const directLaunches = new Set();
 const directRuns = new Map();
 const taskChanges = new EventEmitter();
 let stopping = false;
-const desktopTakeover = "检测到 Codex App 桌面端已接手该会话，已自动降级为排队模式。此工单沿用桌面会话的沙箱和审批设置。";
+let shutdown;
+const desktopTakeover = "该 Codex 会话已有写入者，本单已切换为桌面队列。领取时沿用已有会话的沙箱和审批设置。";
 const completedWatches = new Map();
 const completedWatchLimit = 1024;
 const codexTerminalStates = new Set(["reported", "no_report", "failed", "interrupted"]);
@@ -43,6 +48,10 @@ function conversationOwner(context) {
     throw new Error("Antigravity 未提供会话 ID。请使用支持 MCP 根会话元数据的 agy 1.4.4 或更新版本。");
   }
   return owner;
+}
+
+function assertRunning() {
+  if (stopping) throw new Error("桥接正在关闭。");
 }
 
 function taskById(owner, id) {
@@ -156,8 +165,14 @@ async function readDispatchWorkspace(threadId, savedWorkspace, mode) {
   } catch (error) {
     if (error.code !== -32600 || !error.message.startsWith(`thread not loaded: ${threadId}`)) throw error;
     // The history reader has its own app-server. Let the direct writer attempt to resume the same thread.
-    if (mode === "direct" && savedWorkspace) return workspacePath(savedWorkspace);
-    throw new Error(`未派单。Codex 无法读取绑定会话 ${threadId}（thread/read: thread not loaded）。请在 Codex App 打开该会话后重试。如果会话已不可用，请重新绑定或新开会话。`, { cause: error });
+    if (mode === "direct" && savedWorkspace) {
+      try { return workspacePath(savedWorkspace); }
+      catch { /* Report the unavailable directory with the recovery choices below. */ }
+    }
+    const hint = mode === "direct"
+      ? "没有可用的已绑定目录。请重新绑定可在本机 Codex CLI 读取的会话，或直连新开会话。"
+      : '如有 Codex App，请打开该会话后重试。仅用 CLI 时，可指定 execution_mode: "direct" 重试或新开会话。';
+    throw new Error(`未派单。Codex 无法读取绑定会话 ${threadId}（thread/read: thread not loaded）。${hint}`, { cause: error });
   }
 }
 
@@ -171,6 +186,7 @@ function draftUri(directory, message) {
 }
 
 function createTask(id, owner, sessionName, prompt, target, explicitNewChat, pendingTaskId) {
+  assertRunning();
   const markedPrompt = `[AGY Codex task: ${id}]\n\n${prompt}`;
   return transaction(database, () => {
     const binding = getBinding(database, owner, sessionName);
@@ -249,9 +265,9 @@ async function finishDirect(taskId, run) {
     detail = "Codex 回合已中止。";
   } else if (turn?.status === "failed") {
     state = "failed";
-    detail = turn.error?.message ?? "Codex 回合失败。";
+    detail = run.describeFailure(turn.error?.message ?? "Codex 回合失败。");
   } else {
-    detail = `直连未收到最终状态：${error?.message ?? "未知错误"} 请核对原工单，避免重复派单。`;
+    detail = `直连未收到最终状态：${run.describeFailure(error?.message ?? "未知错误")} 请核对原工单，避免重复派单。`;
   }
   try {
     database.prepare(`
@@ -259,20 +275,32 @@ async function finishDirect(taskId, run) {
       WHERE id = ? AND writer_pid = ?
     `).run(state === "reported" ? final : null, detail, toolResults?.length ? JSON.stringify(toolResults) : null, taskId, process.pid);
   } finally {
-    await run.close();
-    database.prepare(`
-      UPDATE tasks SET state = ?, writer_pid = NULL, dispatch_deadline = NULL
-      WHERE id = ? AND writer_pid = ?
-    `).run(state, taskId, process.pid);
-    directRuns.delete(taskId);
-    taskChanges.emit(taskId);
+    if (await run.close()) {
+      database.prepare(`
+        UPDATE tasks SET state = ?, writer_pid = NULL, dispatch_deadline = NULL
+        WHERE id = ? AND writer_pid = ?
+      `).run(state, taskId, process.pid);
+      directRuns.delete(taskId);
+      taskChanges.emit(taskId);
+    } else {
+      recordUnclosedWriter(taskId);
+    }
   }
+}
+
+function recordUnclosedWriter(taskId) {
+  database.prepare(`
+    UPDATE tasks SET state = 'dispatch_unknown', detail = ?, dispatch_deadline = NULL, approvals_json = NULL
+    WHERE id = ? AND writer_pid = ?
+  `).run("无法确认 Codex 写入进程已退出，已保留占用。请核对原工单和进程状态，避免重复派单。", taskId, process.pid);
+  directRuns.delete(taskId);
+  taskChanges.emit(taskId);
 }
 
 async function launchDirect(owner, sessionName, task, target, sandbox, approvalPolicy) {
   let run;
   try {
-    if (stopping) throw new Error("桥接正在关闭。");
+    assertRunning();
     run = new DirectRun(codex, target.directory, sandbox, approvals => storeApprovals(task.id, approvals));
     directRuns.set(task.id, run);
     const turnId = await run.start({
@@ -290,9 +318,17 @@ async function launchDirect(owner, sessionName, task, target, sandbox, approvalP
     void run.finished.catch(error => process.stderr.write(`AGY Codex Bridge: ${error.message}\n`));
     return "started";
   } catch (error) {
-    await run?.close();
+    if (run && !await run.close()) {
+      recordUnclosedWriter(task.id);
+      return "failed";
+    }
     directRuns.delete(task.id);
-    if (target.threadId && desktopOwnsThread(error)) {
+    if (!stopping && target.threadId && threadHasActiveWriter(error)) {
+      if (sandbox || approvalPolicy) {
+        failBeforeDispatch(owner, sessionName, task, '该 Codex 会话已有写入者。本单要求指定的沙箱或审批策略，未入队。请等原执行结束后重试，或在接受已有会话的权限设置后，去掉覆盖参数并指定 execution_mode: "desktop" 重新派单。');
+        taskChanges.emit(task.id);
+        return "failed";
+      }
       transaction(database, () => {
         database.prepare("UPDATE tasks SET execution_mode = 'desktop', desktop_fallback = 1 WHERE id = ?").run(task.id);
         setBindingMode(owner, sessionName, target.threadId, "desktop");
@@ -300,13 +336,14 @@ async function launchDirect(owner, sessionName, task, target, sandbox, approvalP
       return "fallback";
     }
     const source = error.method ? `（${error.method}）` : "";
+    const reason = run ? run.describeFailure(error.message) : error.message;
     if (run?.turnRequested) {
-      const detail = `直连派单未确认${source}：${error.message}`;
+      const detail = `直连派单未确认${source}：${reason}`;
       database.prepare(`
         UPDATE tasks SET state = 'dispatch_unknown', detail = ?, writer_pid = NULL, dispatch_deadline = NULL WHERE id = ?
       `).run(`${detail} 请查询原工单，避免重复派单。`, task.id);
     } else {
-      failBeforeDispatch(owner, sessionName, task, `直连未派单${source}：${error.message}`);
+      failBeforeDispatch(owner, sessionName, task, `直连未派单${source}：${reason}`);
     }
     taskChanges.emit(task.id);
     return "failed";
@@ -338,7 +375,7 @@ async function waitForResult(owner, taskId, waitSeconds, interval, signal) {
     if (waitingForUser.has(task.state)) return task;
     if (task.writer_pid) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return task;
+      if (remaining <= 0 || task.state === "dispatch_unknown") return task;
       await waitForTaskChange(task, remaining, signal);
       continue;
     }
@@ -366,15 +403,16 @@ server.registerTool("bind", {
   const threadId = threadIdFrom(session);
   const thread = await readThread(threadId);
   const worktree = await inspectWorktree(thread.directory);
+  assertRunning();
   transaction(database, () => {
     assertNoDirectWriter(database, owner, sessionName);
     const previous = bindingWorktree(getBinding(database, owner, sessionName));
     if (worktree && previous && sameWorkspace(worktree.path, previous.path)) worktree.base_commit = previous.base_commit;
-    bindThread(database, owner, threadId, sessionName, thread.directory, worktree);
+    bindThread(database, owner, threadId, sessionName, thread.directory, worktree, defaultMode);
   });
   return reply({
     state: "bound", session_name: sessionName, thread_id: threadId, workspace: thread.directory, name: thread.name,
-    worktree, execution_mode: "desktop",
+    worktree, execution_mode: defaultMode,
     thread_url: `codex://threads/${threadId}`,
   });
 });
@@ -383,6 +421,7 @@ server.registerTool("unbind", {
   description: "当用户说“取消绑定”或“解绑”时，清除当前 Antigravity 对话的 Codex 目标和待绑定请求。已发出的工单仍可查询。",
   inputSchema: { session_name: sessionNameParam },
 }, async ({ session_name: sessionName = defaultSession }, context) => {
+  assertRunning();
   const owner = conversationOwner(context);
   const binding = transaction(database, () => {
     assertNoDirectWriter(database, owner, sessionName);
@@ -400,7 +439,7 @@ server.registerTool("unbind", {
 });
 
 server.registerTool("submit", {
-  description: "向目标子会话发送工单。新会话默认打开 Codex App 草稿，已绑定的桌面会话走排队。显式指定 execution_mode=direct 可切换到直连，同一绑定后续会沿用该模式，直到显式切回 desktop 或桌面占锁触发自动降级。新会话可用 worktree 隔离。",
+  description: `向目标子会话发送工单。新会话的默认模式为 ${defaultMode}。desktop 新会话打开 Codex App 草稿，已有会话走排队。direct 通过 Codex CLI 直连执行。已有绑定沿用其执行模式，除非显式切换或自动降级。新会话可用 worktree 隔离。`,
   inputSchema: {
     prompt: z.string().trim().min(1).max(12000),
     new_chat: z.boolean().optional(),
@@ -415,12 +454,13 @@ server.registerTool("submit", {
   prompt, new_chat: newChat, session_name: sessionName = defaultSession, worktree: isolated,
   follow_up_task_id: followUpTaskId, execution_mode: requestedMode, sandbox, approval_policy: approvalPolicy,
 }, context) => {
+  assertRunning();
   const owner = conversationOwner(context);
   const binding = getBinding(database, owner, sessionName);
   let threadId = newChat ? null : binding?.thread_id ?? null;
   if (followUpTaskId) threadId = validateFollowUp(database, owner, followUpTaskId, newChat, sessionName);
   if (threadId && isolated) throw new Error("只能为新会话创建工作树。请选择未绑定的子会话或明确另开会话。");
-  const mode = requestedMode ?? (threadId ? binding.execution_mode : "desktop");
+  const mode = requestedMode ?? (threadId ? binding.execution_mode : defaultMode);
   if (mode === "desktop" && (sandbox || approvalPolicy)) {
     throw new Error("桌面模式沿用 Codex App 会话设置。要传 sandbox 或 approval_policy，请指定 execution_mode: \"direct\"。");
   }
@@ -452,17 +492,36 @@ server.registerTool("submit", {
         return reportStatus(taskById(owner, task.id), null, { new_task_dispatched: false, worktree, detail: failure });
       }
     }
+    if (stopping) {
+      failBeforeDispatch(owner, sessionName, task, "桥接正在关闭，未派单。");
+      return reportStatus(taskById(owner, task.id), null, { new_task_dispatched: false, ...(worktree && { worktree }) });
+    }
     if (mode === "direct") {
-      const result = await launchDirect(owner, sessionName, task, target, sandbox, approvalPolicy);
+      const launch = launchDirect(owner, sessionName, task, target, sandbox, approvalPolicy);
+      directLaunches.add(launch);
+      let result;
+      try { result = await launch; }
+      finally { directLaunches.delete(launch); }
       if (result !== "fallback") return reportStatus(taskById(owner, task.id));
       detail = desktopTakeover;
     }
     if (threadId) await queueTask(codex, actualWorkspace, threadId, task.message);
     else await startDesktop(task.uri);
   } catch (error) {
-    state = threadId || error.killed ? "dispatch_unknown" : "dispatch_failed";
-    const reason = error.killed ? "本机调度超时。" : error.stderr?.trim().slice(0, 500) || error.code;
-    detail = `调度未确认：${reason ?? "进程返回错误"}。请先查看原任务，避免重复派单。`;
+    if (!threadId && error.code !== "DESKTOP_OPEN_UNCONFIRMED") {
+      failBeforeDispatch(owner, sessionName, task, error.message);
+      taskChanges.emit(task.id);
+      return reportStatus(taskById(owner, task.id), null, {
+        new_task_dispatched: false, ...(worktree && { worktree, worktree_note: worktreeNotice(worktree) }),
+      });
+    }
+    state = "dispatch_unknown";
+    detail = error.message;
+    if (threadId) {
+      const stderr = error.stderr?.replace(/codex:\/\/[^\s"'<>]+/gi, "[Codex URL redacted]").trim().slice(0, 500);
+      const reason = error.killed ? "本机调度超时" : stderr || error.code || "进程返回错误";
+      detail = `队列投递未确认：${reason}。请先查看原任务，避免重复派单。`;
+    }
   } finally {
     activeDispatches.delete(task.id);
   }
@@ -491,7 +550,7 @@ server.registerTool("status", {
     return reply({
       state: "no_task",
       session_name: sessionName,
-      execution_mode: getBinding(database, owner, sessionName)?.execution_mode ?? "desktop",
+      execution_mode: getBinding(database, owner, sessionName)?.execution_mode ?? defaultMode,
       thread_id: binding.bound_thread_id,
       ...binding,
       bindings: await bindingOverview(owner),
@@ -535,6 +594,7 @@ server.registerTool("dismiss", {
   description: "用户明确要求放弃草稿或停止跟踪时使用。仅停止本地跟踪，不代表 Codex App 已撤回执行。",
   inputSchema: { task_id: z.string().uuid() },
 }, async ({ task_id: id }, context) => {
+  assertRunning();
   const owner = conversationOwner(context);
   dismissTask(database, owner, id);
   return reportStatus(taskById(owner, id));
@@ -547,19 +607,30 @@ server.registerTool("resume_draft", {
   const owner = conversationOwner(context);
   taskInSession(owner, id, sessionName);
   const task = await waitForResult(owner, id, 0, 0, context.signal);
+  assertRunning();
   const binding = getBinding(database, owner, sessionName);
-  if (task.state !== "awaiting_send" || binding?.pending_task_id !== id) {
+  if (!["awaiting_send", "dispatch_unknown"].includes(task.state) || task.thread_id || binding?.pending_task_id !== id) {
     throw new Error("只能恢复当前绑定中尚待发送的草稿。");
   }
   if (task.detail?.includes("无法唯一匹配")) throw new Error(task.detail);
   if (!task.draft_prompt) throw new Error("旧版草稿没有保存正文。请在 App 发送原草稿，或放弃后重新派单。");
-  await startDesktop(draftUri(task.workspace, task.draft_prompt));
-  return reportStatus(taskById(owner, id), null, {
-    new_task_dispatched: false, detail: "已重新打开原草稿，请只在一个窗口点击发送。",
-  });
+  let state = "awaiting_send";
+  let detail = "已重新打开原草稿，请只在一个窗口点击发送。";
+  try { await startDesktop(draftUri(task.workspace, task.draft_prompt)); }
+  catch (error) {
+    if (error.code !== "DESKTOP_OPEN_UNCONFIRMED") throw error;
+    state = "dispatch_unknown";
+    detail = error.message;
+  }
+  database.prepare(`
+    UPDATE tasks SET state = ?, detail = ? WHERE id = ? AND state IN ('awaiting_send','dispatch_unknown')
+      AND thread_id IS NULL AND draft_prompt IS NOT NULL
+  `).run(state, detail, id);
+  return reportStatus(taskById(owner, id), null, { new_task_dispatched: false });
 });
 
 function activeDirectRun(owner, taskId) {
+  assertRunning();
   const task = taskById(owner, taskId);
   if (!task) throw new Error("当前 Antigravity 对话没有这条桥接任务。");
   const run = directRuns.get(taskId);
@@ -631,14 +702,25 @@ server.registerTool("watch", {
   }
 });
 
-server.server.onclose = () => {
+function stopBridge() {
+  if (shutdown) return shutdown;
   stopping = true;
-  reader.close();
-  for (const run of directRuns.values()) void run.stop();
-};
-process.stdin.once("end", () => void server.close());
-process.once("SIGINT", () => void server.close());
-process.once("SIGTERM", () => void server.close());
+  shutdown = Promise.resolve().then(async () => {
+    await server.close();
+    const runs = [...directRuns.values()];
+    await Promise.allSettled([reader.close(), ...runs.map(run => run.stop()), ...directLaunches]);
+    await Promise.allSettled(runs.map(run => run.finished));
+  }).catch(error => {
+    process.stderr.write(`AGY Codex Bridge: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+  return shutdown;
+}
+
+server.server.onclose = stopBridge;
+process.stdin.once("end", stopBridge);
+process.on("SIGINT", stopBridge);
+process.on("SIGTERM", stopBridge);
 server.connect(new StdioServerTransport()).catch((error) => {
   process.stderr.write(`AGY Codex Bridge: ${error.message}\n`);
   process.exitCode = 1;
