@@ -62,8 +62,6 @@ Add `--default-mode direct` to the installation command for CLI-only execution. 
 
 To upgrade, update the bridge files in the same folder and rerun the install command with the desired default mode, then restart Antigravity. Repeat for any workspace installs. The installer keeps the state directory recorded in a managed configuration unless you pass `--state-directory <path>`. It refreshes the managed agent and MCP settings, keeps other MCP servers, and stops on an edited agent or conflicting server.
 
-When upgrading from `codex-agy`, the installer adds `agydex` alongside the old agent and keeps using the existing database when you install in place with the same settings.
-
 ### Ask an agent to install it
 
 Copy this prompt into an agent that can use your local terminal.
