@@ -14,7 +14,7 @@ import { addWorktree, inspectWorktree, planWorktree } from "./worktree.mjs";
 import { DirectRun, threadHasActiveWriter } from "./direct-run.mjs";
 
 const {
-  bindingWorktree, bindThread, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask,
+  bindingWorktree, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask,
   sameWorkspace, saveBinding, startDesktop, threadIdFrom, transaction, workspacePath,
 } = core;
 const [, , directory, statePath, codex, defaultMode = "desktop", ...extraArgs] = process.argv;
@@ -408,7 +408,7 @@ server.registerTool("bind", {
     assertNoDirectWriter(database, owner, sessionName);
     const previous = bindingWorktree(getBinding(database, owner, sessionName));
     if (worktree && previous && sameWorkspace(worktree.path, previous.path)) worktree.base_commit = previous.base_commit;
-    bindThread(database, owner, threadId, sessionName, thread.directory, worktree, defaultMode);
+    saveBinding(database, owner, sessionName, threadId, null, thread.directory, worktree, defaultMode);
   });
   return reply({
     state: "bound", session_name: sessionName, thread_id: threadId, workspace: thread.directory, name: thread.name,

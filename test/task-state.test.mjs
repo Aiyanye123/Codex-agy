@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import core from "../core.cjs";
 import { refreshTask, validateFollowUp } from "../src/task-state.mjs";
 
-const { openDatabase, bindThread, recordResult } = core;
+const { openDatabase, saveBinding } = core;
 
 function fixture(t, { state = "queued", threadId = "thread-a", deadline = null } = {}) {
   const db = openDatabase(":memory:");
@@ -93,23 +93,31 @@ test("live local dispatch and unexpired peer dispatch are left alone", async (t)
   assert.equal(task().state, "dispatching");
 });
 
-test("hook receipt wins when history arrives later", async (t) => {
+test("a recorded terminal state wins over a later history check", async (t) => {
   const { db, id, task, userMessage } = fixture(t, { state: "running" });
   db.prepare("UPDATE tasks SET turn_id = 'turn-a' WHERE id = ?").run(id);
   const snapshot = task();
-  recordResult(db, id, "interrupted", null, "hook");
+  await refreshTask(db, history([{ id: "turn-a", status: "interrupted", completedAt: 123, items: [userMessage] }]), snapshot, new Set());
   await refreshTask(db, history([{ id: "turn-a", status: "completed", items: [userMessage, assistant("late")] }]), snapshot, new Set());
   assert.equal(task().state, "interrupted");
-  assert.equal(task().detail, "hook");
+  assert.equal(task().report, null);
+});
+
+test("failed history checks mark expired dispatches as unknown and rethrow", async (t) => {
+  const { db, task } = fixture(t, { state: "dispatching", deadline: Date.now() - 1 });
+  const error = new Error("history unavailable");
+  await assert.rejects(refreshTask(db, { async read() { throw error; } }, task(), new Set()), thrown => thrown === error);
+  assert.equal(task().state, "dispatch_unknown");
+  assert.match(task().detail, /history unavailable/);
 });
 
 test("follow-up requires the original owner and bound chat", (t) => {
   const { db, id } = fixture(t);
-  bindThread(db, "owner", "thread-a");
+  saveBinding(db, "owner", "default", "thread-a", null, null, null);
   assert.equal(validateFollowUp(db, "owner", id, false), "thread-a");
   assert.throws(() => validateFollowUp(db, "owner", id, true), /新开会话/);
   assert.throws(() => validateFollowUp(db, "another-owner", id, false), /原工单/);
-  bindThread(db, "owner", "thread-b");
+  saveBinding(db, "owner", "default", "thread-b", null, null, null);
   assert.throws(() => validateFollowUp(db, "owner", id, false), /换绑或解绑/);
   db.prepare("DELETE FROM bindings WHERE owner = 'owner'").run();
   assert.throws(() => validateFollowUp(db, "owner", id, false), /换绑或解绑/);

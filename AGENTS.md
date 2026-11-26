@@ -9,7 +9,7 @@ This project connects Antigravity CLI to Codex on Windows, macOS, and Linux. Des
 - `src/direct-run.mjs` owns the write connection for a direct turn, including approvals, steering, interruption, and shutdown.
 - `src/worktree.mjs` inspects linked Git worktrees and creates isolated checkouts for new chats.
 - `src/task-state.mjs` reconciles tasks with Codex history. `src/receipt.mjs` extracts replies and formats receipts.
-- `hook.cjs` records Codex hook events. `install.mjs` owns installation and optional project hooks on all three platforms. `Install.ps1` forwards the Windows PowerShell arguments.
+- `install.mjs` configures the bridge on all three platforms. `Install.ps1` forwards the Windows PowerShell arguments.
 - `src/agent.md` guides the Antigravity coordinator. `README.md` and `README.zh-CN.md` document installation and usage.
 
 ## Build and verify
@@ -21,11 +21,11 @@ This project connects Antigravity CLI to Codex on Windows, macOS, and Linux. Des
 
 ## Runtime and data boundaries
 
-- Never read, write, or migrate the live `.state\bridge.sqlite` directly during development or verification. Use a separate Git worktree for schema and hook changes so installed MCP commands and project hooks can keep using the active checkout.
+- Never read, write, or migrate the live `.state\bridge.sqlite` directly during development or verification. Use a separate Git worktree for schema changes so installed MCP commands can keep using the active checkout.
 - Run a global install in the user's real configuration only with explicit authorization. Use an isolated home and state directory for installer tests.
 - Preserve user worktrees and uncommitted changes. Leave worktree cleanup to the user, and move individual files to the Recycle Bin when deletion is authorized.
 - The Antigravity coordinator uses its native terminal with `commandExecutionPolicy: sandbox`. Its tool list includes file viewers and search tools. Keep terminal commands scoped to read-only evidence gathering and authorized routine Git operations. Check for active Codex tasks in the same worktree before writing to Git and obtain explicit authorization for the destination branch before pushing. Keep commands away from sensitive files, cap their output, and delegate source edits, builds, and tests to Codex. `rg` and [ripgrep-all](https://github.com/phiresky/ripgrep-all) are optional.
 - The runtime takes `<workspace> <state-db> <codex> [desktop|direct]`. The installer appends `direct` for `--default-mode direct`. The default applies to new chats and new bindings. Existing bindings keep their saved mode until an explicit switch or an automatic downgrade.
 - Keep execution and history reads on separate connections. A direct turn keeps its slot and thread reserved until the writer exits. Queue once when resume returns an active-writer conflict before turn submission and the task has no explicit sandbox or approval-policy override. Report that the queued turn uses the desktop chat's policy. With an explicit override, report the conflict and let the user decide whether to queue separately.
 - Keep approvals tied to the originating RPC connection and require the user's decision. Direct execution inherits Codex settings. For an explicitly requested restricted sandbox on Windows, pass MXC to the child process only.
-- Cross-process history may report an active turn as `interrupted` with no valid `completedAt`. Keep the task open until history records a valid completion time or a matching Interrupt hook confirms the interruption.
+- Cross-process history may report an active turn as `interrupted`. Treat that history state as terminal only when it includes a valid `completedAt`.

@@ -218,9 +218,8 @@ test("MCP startup clears expired receipts without changing task history or bindi
   } finally { await client.close(); }
 });
 
-test("late hooks and history cannot revive a dismissed task or replace a newer pending binding", async () => {
-  const file = path.join(scratch, "hooks.sqlite");
-  const db = core.openDatabase(file);
+test("late history cannot revive a dismissed task or replace a newer pending binding", async () => {
+  const db = core.openDatabase(":memory:");
   const thread = randomUUID();
   const turn = randomUUID();
   try {
@@ -233,12 +232,6 @@ test("late hooks and history cannot revive a dismissed task or replace a newer p
     const next = insertTask(db, "awaiting_send");
     db.prepare("UPDATE bindings SET pending_task_id = ? WHERE owner = 'owner'").run(next);
     const prompt = `[AGY Codex task: ${id}]\n\nwork`;
-    for (const event of ["UserPromptSubmit", "Stop", "Interrupt"]) {
-      const result = spawnSync(process.execPath, ["hook.cjs", file, root], { cwd: root, encoding: "utf8",
-        input: JSON.stringify({ hook_event_name: event, cwd: root, session_id: thread, turn_id: turn, prompt, last_assistant_message: "finished" }) });
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout, "");
-    }
     await refreshTask(db, { async read(method) {
       if (method === "thread/list") return { data: [{ id: thread, preview: prompt }] };
       return { data: [{ id: turn, status: "completed", items: [{ type: "userMessage", content: [{ type: "text", text: prompt }] }] }] };
@@ -253,39 +246,6 @@ test("late hooks and history cannot revive a dismissed task or replace a newer p
       assert.equal(task.state, "dismissed");
       assert.match(task.detail, /不代表 Codex App 已撤回执行/);
     }
-  } finally { db.close(); }
-});
-
-test("hooks associate multiple prompts with one turn and finish or interrupt all its tasks", () => {
-  const file = path.join(scratch, "shared-hooks.sqlite");
-  const db = core.openDatabase(file);
-  const thread = randomUUID();
-  const get = db.prepare("SELECT state, turn_id, report FROM tasks WHERE id = ?");
-  function hook(name, turn, payload = {}) {
-    const result = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning", "hook.cjs", file, root], {
-      cwd: root, encoding: "utf8",
-      input: JSON.stringify({ hook_event_name: name, cwd: root, session_id: thread, turn_id: turn, ...payload }),
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, "");
-  }
-
-  try {
-    const otherTurn = randomUUID();
-    const other = insertTask(db, "queued", "owner", thread);
-    core.markAccepted(db, other, thread, otherTurn);
-    for (const [event, state, report] of [["Stop", "reported", "finished"], ["Interrupt", "interrupted", null]]) {
-      const turn = randomUUID();
-      const first = insertTask(db, "queued", "owner", thread);
-      const second = insertTask(db, "queued", "owner", thread);
-      for (const id of [first, second]) {
-        hook("UserPromptSubmit", turn, { prompt: `[AGY Codex task: ${id}]\n\nwork` });
-        assert.deepEqual({ ...get.get(id) }, { state: "running", turn_id: turn, report: null });
-      }
-      hook(event, turn, { last_assistant_message: "finished" });
-      for (const id of [first, second]) assert.deepEqual({ ...get.get(id) }, { state, turn_id: turn, report });
-    }
-    assert.deepEqual({ ...get.get(other) }, { state: "running", turn_id: otherTurn, report: null });
   } finally { db.close(); }
 });
 
@@ -315,13 +275,19 @@ test("bounded history pages find a later thread and turn and report ambiguous ma
     let count = 0;
     await refreshTask(db, { async read() { return { data: [], nextCursor: String(++count) }; } }, row(), new Set());
     assert.equal(count, 5);
+    const cursors = [];
+    await refreshTask(db, { async read(_method, { cursor }) {
+      cursors.push(cursor);
+      return { data: [], nextCursor: "repeated" };
+    } }, row(), new Set());
+    assert.deepEqual(cursors, [undefined, "repeated"]);
   } finally { db.close(); }
 });
 
 test("binding directory follows current binding and degrades to null on read failure", async () => {
   const db = core.openDatabase(":memory:");
   try {
-    core.bindThread(db, "owner", "second");
+    core.saveBinding(db, "owner", "default", "second", null, null, null);
     assert.deepEqual(await bindingStatus(db, "owner", async id => ({ directory: "workspace/" + id })),
       { bound_thread_id: "second", bound_workspace: "workspace/second" });
     assert.deepEqual(await bindingStatus(db, "owner", async () => { throw new Error("offline"); }),
@@ -677,8 +643,8 @@ test("MCP status and watch keep receipts compact and recent replies stay inside 
   const legacy = insertTask(db, "reported", "task-owner", thread);
   db.prepare("UPDATE tasks SET report=? WHERE id=?").run(report, task);
   db.prepare("UPDATE tasks SET report=? WHERE id=?").run(oldReport, legacy);
-  core.bindThread(db, "history-owner", thread);
-  core.bindThread(db, "other-owner", otherThread);
+  core.saveBinding(db, "history-owner", "default", thread, null, null, null);
+  core.saveBinding(db, "other-owner", "default", otherThread, null, null, null);
   db.close();
   const program = `
     const core = require("./core.cjs");

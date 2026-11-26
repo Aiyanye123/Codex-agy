@@ -116,8 +116,6 @@ Keep using the default session for everyday work. For parallel work, ask Antigra
 
 To isolate changes, ask for a new session in a Git worktree. Git must be on PATH and the current checkout must have a commit. The bridge creates a sibling of the main checkout named like `MyProject-agy-<task-id>`, on branch `agy/<task-id>` from the current checkout's HEAD. Uncommitted files stay in the current checkout. You can also bind a chat that already uses a worktree. Unbinding or dismissing a task leaves the worktree and branch on disk for you to merge or clean up.
 
-Project hooks are optional. To record worktree activity through hooks, run the hooks-only installer for the worktree path with the same state directory, then review and enable the hooks in Codex App.
-
 ### Everyday commands
 
 | What you want | What to do |
@@ -157,7 +155,6 @@ The bridge's 12 MCP tools cover sessions and tasks through `bind`, `unbind`, `su
 | Linux cannot open a desktop draft | In a desktop session, check `xdg-open` and the `codex://` association. Over SSH or on a headless host, ask for direct execution or set `--default-mode direct`. If the opener timed out, check for the original draft before resending. |
 | `thread/read: thread not loaded` | For desktop mode, open the bound chat in Codex App and retry. For CLI-only use, try direct mode or bind a session the local CLI can read. |
 | Codex finished but Antigravity is quiet | Say “Check the result” in the original conversation. For a desktop draft, send it in Codex App. Approvals for direct turns appear in Antigravity. Approvals for desktop turns appear in Codex App. |
-| You're wondering whether to enable Codex hooks | Antigravity's background wait handles normal completion reports. Project hooks can record acceptance and completion earlier, and record manual interruptions. From the bridge directory, run `node install.mjs --workspace <path> --hooks-only` and give it the same `--state-directory` if you customized it. Review and enable the hooks in Codex Settings or with `/hooks`. |
 
 ## License
 

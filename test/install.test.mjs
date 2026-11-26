@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync, execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,8 +8,6 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import core from "../core.cjs";
-import { hookCommand, isManagedHookCommand } from "../install.mjs";
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const tempRoot = realpathSync.native(tmpdir());
@@ -34,7 +32,7 @@ before(() => {
   sourceAgent = path.join(bridge, "src", "agent.md");
   for (const directory of [path.dirname(sourceAgent), invocation, bin]) mkdirSync(directory, { recursive: true });
   copyFileSync(path.join(repo, "src", "agent.md"), sourceAgent);
-  for (const file of ["install.mjs", "Install.ps1", "mcp.cjs", "core.cjs", "hook.cjs"]) {
+  for (const file of ["install.mjs", "Install.ps1", "mcp.cjs", "core.cjs"]) {
     copyFileSync(path.join(repo, file), path.join(bridge, file));
   }
   codex = path.join(bin, isWindows ? "codex.exe" : "codex");
@@ -141,7 +139,7 @@ test("legacy custom state and SHA-512 receipt support desktop/direct switching a
     timeoutSeconds: 45, disabled: true, tools: { search_workspace: {} },
   } } });
 
-  assert.match(install(["--workspace", dir, "--default-mode", "direct"]), /Existing codex-agy agent files were preserved/);
+  install(["--workspace", dir, "--default-mode", "direct"]);
   const content = readFileSync(sourceAgent, "utf8");
   assert.equal(readFileSync(agent, "utf8"), content);
   assert.equal(existsSync(folderAgent), false);
@@ -193,52 +191,42 @@ test("PowerShell wrapper forwards scope, relative state, defaults and failure ex
   assert.equal(entry.args[2], implicit);
   assert.equal(entry.args[3], path.join(bridge, ".state", "bridge.sqlite"));
 
-  const dir = workspace("wrapper-hooks-only");
-  const noCli = path.join(scratch, "no-cli");
-  mkdirSync(noCli);
-  linkSync(codex, path.join(noCli, "node.exe"));
-  const hooksArgs = ["-Workspace", dir, "-HooksOnly", "-StateDirectory", state];
-  install(hooksArgs, { wrapper: true, testEnv: { ...env, PATH: noCli } });
-  assert.deepEqual(readdirSync(dir), [".codex"]);
-  install([...hooksArgs, "-DefaultMode", "desktop"], { wrapper: true, error: /cannot be combined with --hooks-only/ });
+  const dir = workspace("wrapper-explicit-workspace");
+  const args = ["-Workspace", dir, "-StateDirectory", state];
+  install(args, { wrapper: true });
+  assert.deepEqual(readdirSync(dir), [".agents"]);
+  assert.equal(json(files(path.join(dir, ".agents")).mcp).mcpServers.codex_bridge.args[3], path.join(invocation, state, "bridge.sqlite"));
+  install(["-Workspace", path.join(dir, "missing")], { wrapper: true, error: /Workspace must be a directory/ });
 });
 
-test("conflicts protect the agent, unrelated server and hand-edited hook before any writes", () => {
+test("conflicts protect the agent and unrelated server before any writes", () => {
   const dir = workspace("conflicts");
   const { agent, mcp } = files(path.join(dir, ".agents"));
-  const hookFile = path.join(dir, ".codex/hooks.json");
   const args = ["--workspace", dir, "--state-directory", path.join(scratch, "conflict-state")];
   install(args);
-  const original = new Map([agent, mcp, hookFile].map(file => [file, readFileSync(file, "utf8")]));
+  const originalAgent = readFileSync(agent, "utf8");
+  const originalMcp = readFileSync(mcp, "utf8");
   writeFileSync(agent, "My coordinator\n");
   install([...args, "--default-mode", "direct"], { error: /Custom coordinator preserved/ });
   assert.equal(readFileSync(agent, "utf8"), "My coordinator\n");
-  assert.equal(readFileSync(mcp, "utf8"), original.get(mcp));
-  writeFileSync(agent, original.get(agent));
+  assert.equal(readFileSync(mcp, "utf8"), originalMcp);
+  writeFileSync(agent, originalAgent);
   for (const remote of [false, true]) {
-    const config = JSON.parse(original.get(mcp));
+    const config = JSON.parse(originalMcp);
     const entry = config.mcpServers.codex_bridge;
     if (remote) entry.url = "https://mcp.example.invalid";
     else entry.args[1] = path.join(scratch, "other-bridge", "mcp.cjs");
     writeJson(mcp, config);
     install(args, { error: /Conflicting codex_bridge preserved/ });
     assert.deepEqual(json(mcp), config);
+    assert.equal(readFileSync(agent, "utf8"), originalAgent);
   }
-  writeFileSync(mcp, original.get(mcp));
-  const config = json(hookFile);
-  config.hooks.Stop[0].hooks[0].command = "my-custom-hook";
-  writeJson(hookFile, config);
-  install([...args, "--default-mode", "direct"], { error: /Custom AGY Codex Bridge hook preserved/ });
-  assert.deepEqual(json(hookFile), config);
-  assert.equal(readFileSync(mcp, "utf8"), original.get(mcp));
-  assert.equal(readFileSync(agent, "utf8"), original.get(agent));
 });
 
 test("CLI validates scope and app capabilities and skips relative PATH entries", { skip: !isWindows }, () => {
   const dir = workspace("invalid");
   const args = ["--workspace", dir];
   install([...args, "--global"], { error: /--global cannot be combined/ });
-  install([...args, "--hooks-only", "--default-mode", "direct"], { error: /--default-mode configures MCP/ });
   install([...args, "--default-mode", "invalid"], { error: /must be desktop or direct/ });
 
   linkSync(codex, path.join(invocation, "codex.exe"));
@@ -258,95 +246,4 @@ test("CLI validates scope and app capabilities and skips relative PATH entries",
     writeFileSync(serverProbe, validServer);
   }
   assert.deepEqual(readdirSync(dir), []);
-});
-
-test("Windows reuses old hook registrations and executes all three events with UTF-8", { skip: !isWindows }, () => {
-  const dir = workspace("hooks ' 中文 ＆");
-  const state = path.join(scratch, "hooks state ' 中文 ＆ ‘ ’");
-  const dbPath = path.join(state, "bridge.sqlite");
-  const hook = path.join(bridge, "hook.cjs");
-  const file = path.join(dir, ".codex/hooks.json");
-  const args = ["--workspace", dir, "--hooks-only", "--state-directory", state];
-  const runtime = path.join(process.env.SystemRoot, "System32/WindowsPowerShell/v1.0/powershell.exe");
-  const hooksWithoutCli = { ...env, PATH: "" };
-  install(args, { testEnv: hooksWithoutCli });
-  const config = json(file);
-  const current = config.hooks.Stop[0].hooks[0].command;
-  const prefix = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ";
-  const ps = value => "'" + value.replaceAll("'", "''") + "'";
-  const old = [
-    '$encoding = [Text.UTF8Encoding]::new($false)', '[Console]::InputEncoding = $encoding',
-    '[Console]::OutputEncoding = $encoding', '$OutputEncoding = $encoding', '$payload = [Console]::In.ReadToEnd()',
-    '$payload | & ' + ["C:\\older\\node.exe", warning, hook, "C:\\older\\bridge.sqlite", dir]
-      .map((arg, index) => index === 1 ? arg : ps(arg)).join(" "),
-    'exit $LASTEXITCODE',
-  ].join("\r\n");
-  config.hooks.Stop[0].hooks[0].command = prefix + Buffer.from(old, "utf16le").toString("base64");
-  config.hooks.Stop[0].hooks[0].timeout = 7;
-  config.hooks.Stop[0].hooks.push({ type: "command", command: "echo third-party", statusMessage: "Other" });
-  writeJson(file, config);
-  install(args, { testEnv: hooksWithoutCli });
-  const upgraded = json(file);
-  assert.equal(upgraded.hooks.Stop[0].hooks[0].command, current);
-  assert.deepEqual(upgraded.hooks.Stop[0].hooks[1], config.hooks.Stop[0].hooks[1]);
-  const time = statSync(file).mtimeMs;
-  install(args, { testEnv: hooksWithoutCli });
-  assert.equal(statSync(file).mtimeMs, time);
-  assert.deepEqual(readdirSync(dir), [".codex"]);
-  assert.equal(existsSync(dbPath), false);
-
-  mkdirSync(state);
-  const database = core.openDatabase(dbPath);
-  const stored = database.prepare("SELECT state, report FROM tasks WHERE id = ?");
-  const thread = randomUUID();
-  const execute = (name, record) => {
-    const entry = upgraded.hooks[name][0].hooks[0];
-    assert.equal(entry.timeout, name === "Interrupt" ? 3 : 10);
-    assert.match(entry.command, /^powershell\.exe /);
-    const result = spawnSync(runtime, entry.command.split(" ").slice(1), {
-      cwd: dir, encoding: "utf8", input: "\uFEFF" + JSON.stringify({
-        hook_event_name: name, session_id: thread, cwd: dir, ...record,
-      }), timeout: 8000,
-    });
-    assert.ifError(result.error);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, "");
-  };
-  try {
-    for (const event of ["Stop", "Interrupt"]) {
-      const id = randomUUID();
-      const turn_id = randomUUID();
-      database.prepare("INSERT INTO tasks(id, owner, workspace, state) VALUES (?, 'test', ?, 'awaiting_send')").run(id, dir);
-      execute("UserPromptSubmit", { turn_id, prompt: `[AGY Codex task: ${id}]\r\n\r\n测试任务` });
-      assert.equal(stored.get(id).state, "running");
-      execute(event, { turn_id, last_assistant_message: "完成 ✓ 中文 ‘回执’" });
-      assert.equal(stored.get(id).state, event === "Stop" ? "reported" : "interrupted");
-      if (event === "Stop") assert.equal(stored.get(id).report, "完成 ✓ 中文 ‘回执’");
-    }
-  } finally { database.close(); }
-});
-
-test("POSIX quoting preserves every argv value and recognizes only the managed command shape", () => {
-  const node = "/opt/Node ' \" 中文 $HOME/node";
-  const hook = "/work/Folder ' \" 中文 $HOME; & $(echo injected) \\ script/hook.cjs";
-  const oldState = "/var/Old ' \" 中文 $HOME; & $(echo injected)/bridge.sqlite";
-  const expected = [node, warning, hook, oldState];
-  let sh = "sh";
-  if (isWindows) {
-    const gitExecPath = execFileSync("git", ["--exec-path"], { encoding: "utf8" }).trim();
-    sh = path.resolve(gitExecPath, "../../..", "usr", "bin", "sh.exe");
-  }
-  for (const platform of ["darwin", "linux"]) {
-    const command = hookCommand(node, hook, oldState, platform);
-    const result = spawnSync(sh, ["-s"], {
-      input: `set -- ${command}\nprintf '%s\\0' "$@"\n`, encoding: "utf8", timeout: 5000,
-    });
-    assert.ifError(result.error);
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.stdout.split("\0").slice(0, -1), expected);
-    const target = { node: "/replacement/node", hook, project: "/work", platform };
-    assert.equal(isManagedHookCommand(command, target), true);
-    assert.equal(isManagedHookCommand(command + "; echo custom", target), false);
-    assert.equal(isManagedHookCommand(command, { ...target, hook: "/other/hook.cjs" }), false);
-  }
 });

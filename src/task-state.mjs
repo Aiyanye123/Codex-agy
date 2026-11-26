@@ -111,13 +111,11 @@ export async function readWithRetry(reader, method, params, taskId, signal) {
 
 async function* historyPages(reader, method, params) {
   let cursor;
-  const seen = new Set();
   for (let page = 0; page < 5; page++) {
     const result = await reader.read(method, { ...params, ...(cursor && { cursor }) });
     yield result.data;
+    if (!result.nextCursor || result.nextCursor === cursor) return;
     cursor = result.nextCursor;
-    if (!cursor || seen.has(cursor)) return;
-    seen.add(cursor);
   }
 }
 
@@ -218,11 +216,10 @@ export async function refreshTask(database, reader, task, activeDispatches) {
     if (ambiguity) detail = ambiguity;
   } catch (error) {
     detail = `投递未确认：无法核查原工单历史（${error.message}）。可稍后查询同一单。`;
+    throw error;
+  } finally {
+    // A matching turn or late dispatch receipt takes precedence over a missing history entry.
     database.prepare("UPDATE tasks SET state = 'dispatch_unknown', detail = ? WHERE id = ? AND state = 'dispatching'")
       .run(detail, task.id);
-    throw error;
   }
-  // A matching turn, hook or late dispatch receipt takes precedence over a missing history entry.
-  database.prepare("UPDATE tasks SET state = 'dispatch_unknown', detail = ? WHERE id = ? AND state = 'dispatching'")
-    .run(detail, task.id);
 }

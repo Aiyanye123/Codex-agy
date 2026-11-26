@@ -116,8 +116,6 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 
 需要隔离改动时，可以要求「用独立 Git 工作树新开一个子会话」。Git 需在 PATH 中，当前检出需已有提交。桥接从当前检出的 HEAD 创建 `agy/<工单 ID>` 分支，把工作树放在主检出的同级目录，名称类似 `MyProject-agy-<工单 ID>`。未提交的改动留在原检出。也可以绑定已有工作树中的 Codex 会话。解绑或放弃工单后，工作树与分支保留，由你自行合并或清理。
 
-项目钩子可选。若要通过钩子记录工作树中的接单、回执和中断，可对该工作树路径运行仅安装钩子的命令，使用同一个状态目录，并在 Codex App 审查启用。
-
 ### 日常操作
 
 | 你想做什么 | 怎么操作 |
@@ -157,7 +155,6 @@ Gemini 确认绑定和工作目录后，你就可以在 Antigravity 提任务。
 | Linux 打不开桌面草稿 | 有图形会话时检查 `xdg-open` 与 `codex://` 协议关联。用 SSH 或没有图形界面时，可以请求直连或安装时设置 `--default-mode direct`。打开器超时后先检查原草稿，避免重复发送。 |
 | `thread/read: thread not loaded` | 桌面模式可在 App 打开会话后重试。仅用 CLI 时，可改用直连或绑定当前 CLI 能读取的会话。 |
 | Codex 做完了，Antigravity 还没汇报 | 在原对话说「查结果」。等待发送的桌面草稿需在 Codex App 发送。直连工单的审批出现在 Antigravity，桌面工单的审批出现在 Codex App。 |
-| 是否需要启用 Codex 钩子 | Antigravity 的后台等待可提供日常完成汇报。项目钩子可更早记录接单和完成，也可记录手动中断。在桥接目录运行 `node install.mjs --workspace <路径> --hooks-only`，使用自定义状态目录时也传同一个 `--state-directory`，然后在 Codex 设置或 `/hooks` 中审查并启用。 |
 
 ## 开源协议
 

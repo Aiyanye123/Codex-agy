@@ -163,10 +163,6 @@ function saveBinding(database, owner, sessionName, threadId, pendingTaskId, work
     worktree?.repo_root ?? null, worktree?.path ?? null, worktree?.branch ?? null, worktree?.base_commit ?? null, executionMode);
 }
 
-function bindThread(database, owner, threadId, sessionName = defaultSession, workspace = null, worktree = null, executionMode = "desktop") {
-  saveBinding(database, owner, sessionName, threadId, null, workspace, worktree, executionMode);
-}
-
 function bindingWorktree(binding) {
   if (!binding?.worktree_path) return null;
   return {
@@ -410,6 +406,6 @@ class CodexReader {
 }
 
 module.exports = {
-  bindingWorktree, bindThread, childLifecycle, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask, recordResult, saveBinding,
+  bindingWorktree, childLifecycle, CodexReader, defaultSession, getBinding, markAccepted, openDatabase, queueTask, recordResult, saveBinding,
   sameWorkspace, startDesktop, taskMarker, threadIdFrom, transaction, workspacePath,
 };
